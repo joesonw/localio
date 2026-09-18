@@ -29,6 +29,14 @@ browser tab                      localio                        your application
 npx @joesonw/localio   # http://127.0.0.1:8080
 ```
 
+npm 12 blocks dependency install scripts unless the *installing* project allows them, and
+`better-sqlite3` needs its one to build the native binding. On npm >= 12:
+
+```bash
+npx --allow-scripts=better-sqlite3 @joesonw/localio
+# or once, for good: npm config set allow-scripts=better-sqlite3 --location=user
+```
+
 Or from a clone, which is also how you get `--watch` on the sources:
 
 ```bash

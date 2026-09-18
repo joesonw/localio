@@ -39,6 +39,10 @@
   "publishConfig": {
     "access": "public"
   },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": true
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
