@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Copy to seed.json and point LOCALIO_SEED at it. Applied on every boot, upserting —",
+    "accounts keyed by sid, numbers by the number — so it is safe to check in and safe to",
+    "run twice. Pin account_sid and auth_token to whatever your application already has in",
+    "its own configuration, and this simulator will answer to it.",
+    "A number with no account_sid joins the first account in this file.",
+    "parent_account_sid makes an account a subaccount. Either order works — the parent may",
+    "be listed after the child — and the parent's credentials open the child over REST."
+  ],
+  "accounts": [
+    {
+      "account_sid": "AC00000000000000000000000000000001",
+      "auth_token": "0123456789abcdef0123456789abcdef",
+      "friendly_name": "development"
+    },
+    {
+      "account_sid": "AC00000000000000000000000000000002",
+      "auth_token": "fedcba9876543210fedcba9876543210",
+      "friendly_name": "tenant-a",
+      "parent_account_sid": "AC00000000000000000000000000000001"
+    }
+  ],
+  "numbers": [
+    {
+      "phone_number": "+15550000001",
+      "friendly_name": "main line",
+      "voice_url": "http://127.0.0.1:3000/webhooks/voice",
+      "voice_method": "POST",
+      "status_callback_url": "http://127.0.0.1:3000/webhooks/status",
+      "sms_url": "http://127.0.0.1:3000/webhooks/sms",
+      "sms_method": "POST"
+    },
+    {
+      "phone_number": "+15550000002",
+      "account_sid": "AC00000000000000000000000000000002",
+      "friendly_name": "tenant-a line",
+      "voice_url": "http://127.0.0.1:3000/webhooks/voice",
+      "sms_url": "http://127.0.0.1:3000/webhooks/sms"
+    }
+  ]
+}

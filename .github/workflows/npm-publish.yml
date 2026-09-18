@@ -1,0 +1,76 @@
+name: npm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Trusted publishing: npm verifies this run's OIDC identity instead of a token,
+      # and the same identity is what signs the provenance attestation.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # Writes the .npmrc that points publish at npmjs.org. No NODE_AUTH_TOKEN:
+          # there is no NPM_TOKEN secret anywhere in this workflow, by design.
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Node 22 ships npm 10; trusted publishing needs >= 11.5.1.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      # The same hermetic suite ci.yml runs, and the build that proves
+      # tsconfig.build.json plus the src/db/*.sql copy still work.
+      - run: npm test
+      - run: npm run build
+
+      # Packs the tarball and proves files/bin/shebang are right without touching the
+      # registry — so a fork PR needs no credential and is never a red run.
+      - name: Pack only (pull requests)
+        if: github.event_name == 'pull_request'
+        run: npm publish --dry-run
+
+      # A v* tag that does not name the version in package.json is a release that lies
+      # about what it contains. Fail before anything reaches the registry.
+      - name: Tag must match package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$pkg" = "$tag" ] || { echo "tag $GITHUB_REF_NAME != package.json $pkg"; exit 1; }
+
+      # main publishes only when package.json names a version the registry lacks, so an
+      # ordinary merge is a no-op rather than a failed run — and re-running a tag's
+      # workflow is idempotent rather than a 403 over an existing version.
+      - id: check
+        if: github.event_name != 'pull_request'
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$name@$version is already on the registry — nothing to do"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `access` comes from package.json's publishConfig; provenance is generated
+      # automatically from the OIDC identity, so neither a --provenance flag nor a
+      # publishConfig entry belongs here. Setting `provenance: true` in publishConfig
+      # would apply to every publish including a local one, where there is no CI
+      # provider to attest against — that is a hard failure, not a skipped attestation.
+      - if: github.event_name != 'pull_request' && steps.check.outputs.published == 'false'
+        run: npm publish

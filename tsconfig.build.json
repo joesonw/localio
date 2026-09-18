@@ -1,0 +1,5 @@
+{
+  "//": "The build. Same options, minus the tests — `npm test` typechecks those with the base config, so nothing goes unchecked.",
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts"]
+}

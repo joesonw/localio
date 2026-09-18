@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.idea
+.vscode
+node_modules
+dist
+data
+tmp
+out-tsc
+*.log
+.DS_Store
+CLAUDE.md
+Dockerfile
+.dockerignore

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      # Typechecks src including the tests, then runs node's test runner.
+      # Hermetic: no sockets, no network, :memory: SQLite, tmpdir for recordings.
+      - run: npm test
+
+      # Proves tsconfig.build.json and the src/db/*.sql copy step still work.
+      - run: npm run build

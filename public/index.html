@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>localio</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9742;</text></svg>" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <h1>localio</h1>
+        <p class="sub">a local Twilio: voice, SMS and recordings, on SQLite</p>
+      </div>
+      <p class="warn" role="note">
+        Development tool. Nothing here is authenticated — the admin API hands out auth
+        tokens and recordings are served without credentials. Do not deploy it.
+      </p>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" class="tab on" data-panel="phone">Phone</button>
+      <button role="tab" class="tab" data-panel="admin">Admin</button>
+    </nav>
+
+    <main>
+      <!-- -------------------------------------------------------------- admin -->
+      <section id="panel-admin" class="panel">
+        <div class="cols">
+          <div class="col">
+            <h2>Accounts</h2>
+            <p class="hint">
+              An account is a credential pair. Paste the sid and token into the application
+              you are testing, and point its Twilio base URL at
+              <code id="base-url">this server</code>. Name a parent to make a
+              <strong>subaccount</strong> &mdash; a full account with its own sid, token and
+              numbers, which the parent's credentials also open.
+            </p>
+            <form id="account-form" class="row-form">
+              <input id="account-parent" type="text" placeholder="parent account (optional)" />
+              <input id="account-name" type="text" placeholder="friendly name" maxlength="200" />
+              <button type="submit">New account</button>
+            </form>
+            <div id="account-error" class="error" hidden></div>
+            <table class="grid" id="accounts">
+              <thead>
+                <tr><th>Account SID</th><th>Name</th><th>Status</th><th>Numbers</th><th>Keys</th><th>Auth token</th><th></th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+
+            <h2>API keys</h2>
+            <p class="hint">
+              The other credential Twilio accepts: the <code>SK…</code> is the username and
+              its secret the password. Webhooks are still signed with the account's auth
+              token — a key opens the API, it never signs.
+            </p>
+            <form id="key-form" class="row-form">
+              <input id="k-account" type="text" required placeholder="account" />
+              <input id="k-name" type="text" placeholder="friendly name" maxlength="200" />
+              <button type="submit">New key</button>
+            </form>
+            <div id="key-error" class="error" hidden></div>
+            <table class="grid" id="keys">
+              <thead>
+                <tr><th>Key SID</th><th>Account</th><th>Name</th><th>Secret</th><th></th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="col wide">
+            <h2>Phone numbers</h2>
+            <p class="hint">
+              A number's webhook URLs are both where a webhook is sent and what its
+              signature is computed over, exactly as at Twilio. Edit them in place.
+            </p>
+            <form id="number-form" class="stack">
+              <div class="fields">
+                <label>Phone number<input id="n-number" type="text" placeholder="+15551234567" required /></label>
+                <label>Account<input id="n-account" type="text" required placeholder="account" /></label>
+                <label>Name<input id="n-name" type="text" placeholder="main line" /></label>
+              </div>
+              <div class="fields">
+                <label>Voice URL<input id="n-voice" type="url" placeholder="http://localhost:3000/voice" /></label>
+                <label class="narrow">Method<select id="n-voice-method"><option>POST</option><option>GET</option></select></label>
+                <label>Status callback<input id="n-status" type="url" placeholder="http://localhost:3000/status" /></label>
+              </div>
+              <div class="fields">
+                <label>SMS URL<input id="n-sms" type="url" placeholder="http://localhost:3000/sms" /></label>
+                <label class="narrow">Method<select id="n-sms-method"><option>POST</option><option>GET</option></select></label>
+                <label>SMS status callback<input id="n-sms-status" type="url" /></label>
+              </div>
+              <div class="actions"><button type="submit">Add number</button></div>
+            </form>
+            <div id="number-error" class="error" hidden></div>
+            <div id="numbers"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- -------------------------------------------------------------- phone -->
+      <section id="panel-phone" class="panel on">
+        <!--
+          Calls waiting to be picked up, and the one thing on this panel that is
+          deliberately *not* the picker's number: it sits above the picker because it is
+          what is waiting anywhere, not what is waiting here. Picking one up sets the
+          picker to that call's own number, which is what puts everything below back in
+          step.
+        -->
+        <div id="incoming" class="pending-bar" hidden></div>
+        <div id="pending-error" class="error" hidden></div>
+
+        <!--
+          One number at a time. The picker below is the handset's identity — the call
+          history, the keypad and the conversations under it are all that number's, which is
+          why there is no second number select anywhere on this page.
+        -->
+        <div class="sim-bar">
+          <label class="sim-label" for="sim">This handset is</label>
+          <input id="sim" type="text" />
+          <span class="sim-hint" id="sim-hint"></span>
+        </div>
+
+        <div class="cols phone-cols">
+          <!-- ------------------------------------------------------- call history -->
+          <div class="col">
+            <h2>Calls</h2>
+            <div id="call-history"><p class="empty">No calls yet.</p></div>
+          </div>
+
+          <!-- ------------------------------------------------------------- handset -->
+          <div class="col phone-col">
+            <h2>Keypad</h2>
+            <div class="handset">
+              <div class="dial-row">
+                <input id="p-peer" type="text" />
+                <button type="button" id="p-clear" class="link" title="backspace">⌫</button>
+              </div>
+              <div id="dial-error" class="error" hidden></div>
+              <div class="keypad" id="h-keypad">
+                <button type="button" data-digit="1">1</button><button type="button" data-digit="2">2</button><button type="button" data-digit="3">3</button>
+                <button type="button" data-digit="4">4</button><button type="button" data-digit="5">5</button><button type="button" data-digit="6">6</button>
+                <button type="button" data-digit="7">7</button><button type="button" data-digit="8">8</button><button type="button" data-digit="9">9</button>
+                <button type="button" data-digit="*">*</button><button type="button" data-digit="0">0</button><button type="button" data-digit="#">#</button>
+              </div>
+              <div class="actions call-actions">
+                <button type="button" id="call-button" class="call">Call</button>
+                <button type="button" id="hangup-button" disabled class="danger">Hang up</button>
+              </div>
+              <div class="meters">
+                <div class="meter"><span>mic</span><div class="bar"><i id="h-mic-level"></i></div></div>
+                <div class="meter"><span>spk</span><div class="bar"><i id="h-spk-level"></i></div></div>
+                <button type="button" id="h-mute" disabled>Mute</button>
+                <span id="h-state" class="state">idle</span>
+              </div>
+              <details class="devices">
+                <summary>Audio devices</summary>
+                <div class="fields">
+                  <label>Microphone<select id="h-mic"></select></label>
+                  <label>Speaker<select id="h-speaker"></select></label>
+                </div>
+              </details>
+            </div>
+
+            <h2>Event log</h2>
+            <div id="h-log" class="log"><p class="empty">Nothing yet.</p></div>
+          </div>
+
+          <!-- ---------------------------------------------------------- messages -->
+          <div class="col">
+            <h2>Messages</h2>
+            <div id="sms-list"><p class="empty">No messages yet.</p></div>
+            <div id="sms-detail" hidden>
+              <div class="sms-head">
+                <button type="button" id="sms-back" class="link">‹ All messages</button>
+                <span id="sms-peer" class="card-title"></span>
+              </div>
+              <div id="thread" class="thread"></div>
+              <form id="sms-form" class="stack compose">
+                <textarea id="s-body" rows="2" maxlength="1600" placeholder="Send as this number…" required></textarea>
+                <div class="actions"><button type="submit">Send</button></div>
+              </form>
+              <div id="sms-error" class="error" hidden></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
