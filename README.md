@@ -94,7 +94,8 @@ from inside a container is rarely the default: set it when recordings come back 
 URL your application cannot fetch.
 
 Images are published on every tag (`joesonw/localio:1.2.3`, `:1.2`, `:1`, `:latest`) and
-on `main` (`:main`), for `linux/amd64` and `linux/arm64`.
+on `main` (`:main`), for `linux/amd64` and `linux/arm64`. The image's page on Docker Hub is
+[DOCKERHUB.md](DOCKERHUB.md), pushed by the same workflow that builds the image.
 
 ## The two panels
 
