@@ -1,5 +1,11 @@
 # localio
 
+[![npm](https://img.shields.io/npm/v/@joesonw/localio)](https://www.npmjs.com/package/@joesonw/localio)
+[![CI](https://github.com/joesonw/localio/actions/workflows/ci.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/ci.yml)
+[![npm publish](https://github.com/joesonw/localio/actions/workflows/npm-publish.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/npm-publish.yml)
+[![Docker](https://github.com/joesonw/localio/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/docker-publish.yml)
+[![license](https://img.shields.io/npm/l/@joesonw/localio)](LICENSE)
+
 A local Twilio. Voice, SMS and recordings, on SQLite, in one process.
 
 Point your application's Twilio base URL at it and it answers the REST API. Give one of
