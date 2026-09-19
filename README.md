@@ -4,6 +4,8 @@
 [![CI](https://github.com/joesonw/localio/actions/workflows/ci.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/ci.yml)
 [![npm publish](https://github.com/joesonw/localio/actions/workflows/npm-publish.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/npm-publish.yml)
 [![Docker](https://github.com/joesonw/localio/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/joesonw/localio/actions/workflows/docker-publish.yml)
+[![docker image version](https://img.shields.io/docker/v/joesonw/localio?sort=semver&label=docker)](https://hub.docker.com/r/joesonw/localio)
+[![docker pulls](https://img.shields.io/docker/pulls/joesonw/localio)](https://hub.docker.com/r/joesonw/localio)
 [![license](https://img.shields.io/npm/l/@joesonw/localio)](LICENSE)
 
 A local Twilio. Voice, SMS and recordings, on SQLite, in one process.
