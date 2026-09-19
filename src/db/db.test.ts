@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { segmentCount } from './messages.js';
+import { nanpNumber } from './numbers.js';
 import { Store } from './index.js';
 
 function store(): Store {
@@ -297,6 +298,50 @@ test('upsert is safe to run twice, which is what a seed file needs', () => {
   assert.equal(s.numbers.list().length, 1);
   assert.equal(s.numbers.findByNumber('+15550000001')?.voiceUrl, 'http://a.test/2');
   assert.equal(s.accounts.list().length, 1);
+});
+
+/* -------------------------------------------------------------- area codes */
+
+test('a generated number is a valid NANP line in the area code asked for', () => {
+  for (let i = 0; i < 500; i += 1) {
+    assert.match(nanpNumber('415'), /^\+1415[2-9]\d{6}$/);
+  }
+});
+
+test('allocating in an area code never hands out the same number twice', () => {
+  const { store: s, accountSid } = seeded();
+  const seen = new Set<string>();
+  for (let i = 0; i < 200; i += 1) {
+    const number = s.numbers.createInAreaCode('415', { accountSid });
+    assert.notEqual(number, null);
+    seen.add(number!.phoneNumber);
+  }
+  assert.equal(seen.size, 200, 'every allocation must be distinct');
+  assert.equal(s.numbers.list(accountSid).length, 201, 'and every one is really held');
+});
+
+/**
+ * The only thing that exercises the constraint-catch path: a `rand` that always returns
+ * the same value makes every candidate identical, so the second allocation collides
+ * twenty times and gives up.
+ */
+test('an exhausted area code is a null rather than a duplicate', () => {
+  const { store: s, accountSid } = seeded();
+  const first = s.numbers.createInAreaCode('415', { accountSid }, () => 0);
+  assert.equal(first?.phoneNumber, '+14152000000');
+  assert.equal(s.numbers.createInAreaCode('415', { accountSid }, () => 0), null);
+  assert.equal(s.numbers.list(accountSid).length, 2, 'the collision wrote nothing');
+});
+
+/** The friendly name falls back to the number the allocator picked, not to blank. */
+test('an allocated number is named after itself', () => {
+  const { store: s, accountSid } = seeded();
+  const number = s.numbers.createInAreaCode('212', { accountSid })!;
+  assert.equal(number.friendlyName, number.phoneNumber);
+  assert.equal(
+    s.numbers.createInAreaCode('212', { accountSid, friendlyName: 'support' })!.friendlyName,
+    'support',
+  );
 });
 
 /* ------------------------------------------------------------------ messages */

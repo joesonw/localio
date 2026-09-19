@@ -89,6 +89,84 @@ test('a provisioned number is one this simulator really holds', async () => {
   await server.close();
 });
 
+/* ------------------------------------------------------------- by area code */
+
+/** Twilio's other way to buy: name the NPA and let the provider pick the line. */
+test('an area code provisions a real number in that area code', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'AreaCode=415',
+  });
+  assert.equal(response.statusCode, 201);
+  assert.match(response.json().phone_number, /^\+1415[2-9]\d{6}$/);
+  assert.notEqual(store.numbers.findByNumber(response.json().phone_number), null);
+  await server.close();
+});
+
+test('provisioning the same area code repeatedly never repeats a number', async () => {
+  const { server, accountSid, auth } = await fixture();
+  const seen = new Set<string>();
+  for (let i = 0; i < 50; i += 1) {
+    const response = await server.app.inject({
+      method: 'POST',
+      url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers.json`,
+      headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'AreaCode=415',
+    });
+    assert.equal(response.statusCode, 201);
+    seen.add(response.json().phone_number);
+  }
+  assert.equal(seen.size, 50);
+  await server.close();
+});
+
+/** Both spellings at once is `PhoneNumber`'s, which is what Twilio does. */
+test('an explicit number wins over an area code', async () => {
+  const { server, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'PhoneNumber=%2B15550000007&AreaCode=415',
+  });
+  assert.equal(response.statusCode, 201);
+  assert.equal(response.json().phone_number, '+15550000007');
+  await server.close();
+});
+
+test('a malformed area code is refused and the message names it', async () => {
+  const { server, accountSid, auth } = await fixture();
+  for (const areaCode of ['41', '1150', '115', 'abc']) {
+    const response = await server.app.inject({
+      method: 'POST',
+      url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers.json`,
+      headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+      payload: `AreaCode=${areaCode}`,
+    });
+    assert.equal(response.statusCode, 400, areaCode);
+    assert.equal(response.json().code, 21421, areaCode);
+    assert.match(response.json().message, new RegExp(areaCode));
+  }
+  await server.close();
+});
+
+/** Neither field is still the E.164 complaint — that path did not move. */
+test('provisioning with neither a number nor an area code is a 21421', async () => {
+  const { server, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'FriendlyName=nothing',
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, 21421);
+  await server.close();
+});
+
 /**
  * **RFC 2822, and `duration` is a string.** An ISO 8601 date becomes an `Invalid Date`
  * inside the SDK, silently; a numeric duration is not what its deserializer expects.

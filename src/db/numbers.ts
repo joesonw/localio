@@ -65,6 +65,22 @@ export interface NumberInput {
 /** Everything a `PATCH` may change. The number itself and its account are not on this list. */
 export type NumberPatch = Omit<Partial<NumberInput>, 'phoneNumber' | 'sid'>;
 
+/** How many candidates `createInAreaCode` draws before it gives up. */
+const ATTEMPTS = 20;
+
+/**
+ * A NANP line in `areaCode`: `+1` NPA NXX XXXX, with the exchange starting 2-9.
+ *
+ * Eight million per area code, which is what makes the retry in `createInAreaCode` a
+ * formality rather than a loop anybody waits on. `rand` is a seam for the test that has
+ * to make a collision happen on purpose.
+ */
+export function nanpNumber(areaCode: string, rand: () => number = Math.random): string {
+  const exchange = 200 + Math.floor(rand() * 800);
+  const line = Math.floor(rand() * 10000);
+  return `+1${areaCode}${exchange}${String(line).padStart(4, '0')}`;
+}
+
 /**
  * The numbers this simulator answers for, and the URLs it calls when one is dialled or
  * texted.
@@ -107,6 +123,34 @@ export class PhoneNumbers {
       )
       .run(record);
     return record;
+  }
+
+  /**
+   * Provision *some* unheld number in `areaCode`, or `null` if it could not find one.
+   *
+   * **The UNIQUE constraint on `phone_number` is the guarantee here, not a lookup before
+   * the insert.** Generating a candidate, asking `findByNumber` about it and inserting it
+   * afterwards is a window this does not need to have, and it duplicates a promise SQLite
+   * already keeps. A collision is caught and redrawn; running out of draws is what `null`
+   * means, and the route turns that into Twilio's "no numbers available".
+   *
+   * The friendly name falls back to the number, which is the same default the E.164 path
+   * uses — but only this side knows the number in time to apply it.
+   */
+  createInAreaCode(
+    areaCode: string,
+    input: Omit<NumberInput, 'phoneNumber'>,
+    rand?: () => number,
+  ): PhoneNumber | null {
+    for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+      const phoneNumber = nanpNumber(areaCode, rand);
+      try {
+        return this.create({ ...input, phoneNumber, friendlyName: input.friendlyName ?? phoneNumber });
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
+      }
+    }
+    return null;
   }
 
   /** Create or update, keyed by the **number** rather than by the sid — a seed file names numbers. */

@@ -219,7 +219,7 @@ at the top, which are absolute.
 | `GET Messages/:sid.json` | one message. |
 | `GET POST Keys.json` | list and mint API keys. The create is the only answer that carries the `secret` — a read never does, exactly as at Twilio. |
 | `GET POST DELETE Keys/:sid.json` | fetch, rename (a `POST`, because that is what the SDK sends) and delete. A key of another account is a `20404`: across that boundary it does not exist. |
-| `POST GET IncomingPhoneNumbers.json` | provision and list. A number provisioned here is one localio actually holds and answers for. |
+| `POST GET IncomingPhoneNumbers.json` | provision and list. A number provisioned here is one localio actually holds and answers for. `AreaCode` may stand in for `PhoneNumber`, as at Twilio: localio mints an unheld NANP number in that area code and hands it back. |
 | `GET POST DELETE IncomingPhoneNumbers/:sid.json` | fetch, update, release. The update is a `POST`, because that is what the SDK sends. |
 | `GET Recordings/:sid.json` | recording metadata. |
 | `GET Calls/:sid/Recordings.json` | the recordings of one call. |

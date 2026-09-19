@@ -421,7 +421,46 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
     const body = request.body as Record<string, string>;
-    const phoneNumber = body?.PhoneNumber ?? body?.AreaCode ?? '';
+    const settings = {
+      accountSid: account.accountSid,
+      friendlyName: body?.FriendlyName,
+      voiceUrl: body?.VoiceUrl ?? null,
+      voiceMethod: body?.VoiceMethod ?? 'POST',
+      statusCallbackUrl: body?.StatusCallback ?? null,
+      statusCallbackMethod: body?.StatusCallbackMethod ?? 'POST',
+      smsUrl: body?.SmsUrl ?? null,
+      smsMethod: body?.SmsMethod ?? 'POST',
+      smsStatusCallbackUrl: body?.SmsStatusCallback ?? null,
+    };
+    const phoneNumber = body?.PhoneNumber?.trim() ?? '';
+    const areaCode = body?.AreaCode?.trim() ?? '';
+
+    /**
+     * **`AreaCode` names an NPA, not a number**, and Twilio picks the line itself.
+     *
+     * This field used to be read as a second spelling of `PhoneNumber`, which meant a
+     * real `areaCode: '415'` came back `21421 PhoneNumber is not a valid E.164 number` —
+     * an error naming a parameter the caller never sent, about a value that was fine.
+     * `PhoneNumber` still wins when both are given, as it does at Twilio.
+     */
+    if (!phoneNumber && areaCode) {
+      if (!/^[2-9]\d{2}$/.test(areaCode)) {
+        return twilioError(reply, 400, 21421, `${areaCode} is not a valid area code`);
+      }
+      const allocated = store.numbers.createInAreaCode(areaCode, settings);
+      if (allocated === null) {
+        // The area code was fine and the inventory was not, which is a different thing
+        // from a bad request and has its own Twilio code.
+        return twilioError(
+          reply,
+          400,
+          21452,
+          `No phone numbers available in area code ${areaCode}`,
+        );
+      }
+      return reply.code(201).send(numberResource(allocated));
+    }
+
     if (!phoneNumber.startsWith('+')) {
       return twilioError(reply, 400, 21421, 'PhoneNumber is not a valid E.164 number');
     }
@@ -429,16 +468,9 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       return twilioError(reply, 400, 21422, `${phoneNumber} is already held`);
     }
     const number = store.numbers.create({
-      accountSid: account.accountSid,
+      ...settings,
       phoneNumber,
-      friendlyName: body.FriendlyName ?? phoneNumber,
-      voiceUrl: body.VoiceUrl ?? null,
-      voiceMethod: body.VoiceMethod ?? 'POST',
-      statusCallbackUrl: body.StatusCallback ?? null,
-      statusCallbackMethod: body.StatusCallbackMethod ?? 'POST',
-      smsUrl: body.SmsUrl ?? null,
-      smsMethod: body.SmsMethod ?? 'POST',
-      smsStatusCallbackUrl: body.SmsStatusCallback ?? null,
+      friendlyName: settings.friendlyName ?? phoneNumber,
     });
     return reply.code(201).send(numberResource(number));
   });
