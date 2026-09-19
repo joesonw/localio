@@ -674,6 +674,9 @@ function renderSim() {
     hint.textContent = known.voice_url;
   }
   document.getElementById('call-button').disabled = handset.live || !known;
+  // Not gated on `handset.live`: texting while a call is up is a real thing to
+  // simulate, and the two share nothing but the number box.
+  document.getElementById('text-button').disabled = !known;
 }
 
 /* -------------------------------------------------------------- the keypad */
@@ -710,6 +713,32 @@ document.getElementById('call-button').addEventListener('click', async () => {
   // The handset only ever dials **in**: this is somebody ringing the number the picker is
   // set to. An outbound call is placed through `POST …/Calls.json` and answered below.
   await handset.dial({ type: 'dial', from: other, to: state.sim });
+});
+
+/**
+ * Start a conversation with the number in the dial box.
+ *
+ * What the Call button does, in text: the thread this opens is that number talking to
+ * this handset, which is the direction `#sms-form` already sends. **Nothing is sent
+ * here** — it only puts the compose box in front of a peer that may never have texted
+ * before, which the thread list alone cannot do, since a conversation with no messages
+ * in it is not in the list.
+ */
+document.getElementById('text-button').addEventListener('click', async () => {
+  const other = peer.value.trim();
+  if (!state.sim) {
+    showError('dial-error', new Error('pick one of your numbers above first'));
+    return;
+  }
+  if (!other) {
+    showError('dial-error', new Error('type the number that is texting in'));
+    return;
+  }
+  showError('dial-error', null);
+  showError('sms-error', null);
+  state.smsPeer = other;
+  await loadMessages();
+  document.getElementById('s-body').focus();
 });
 
 document.getElementById('hangup-button').addEventListener('click', () => handset.hangup());
@@ -1019,6 +1048,9 @@ document.getElementById('sms-back').addEventListener('click', () => {
 
 async function loadThread() {
   document.getElementById('sms-peer').textContent = state.smsPeer;
+  // Named, because this box sends *as the peer* — "this number" reads as the handset,
+  // which is the one thing it is not. Safe on every poll: a placeholder is not a value.
+  document.getElementById('s-body').placeholder = `Send as ${state.smsPeer}…`;
   const ours = new Set(state.numbers.map((number) => number.phone_number));
   const { messages } = await api(
     `/api/messages?a=${encodeURIComponent(state.sim)}&b=${encodeURIComponent(state.smsPeer)}`,

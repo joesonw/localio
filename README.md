@@ -171,10 +171,13 @@ served as `audio/wav` without credentials, the way Twilio's own media URL is.
 ## SMS between two numbers
 
 A message reaches localio either from your application (`POST …/Messages.json`) or from the
-Phone panel's messages column. If the destination is a number localio holds and it has an `sms_url`, the
-message is **delivered**: a signed inbound messaging webhook goes to that URL, and any
-`<Message>` in the TwiML that comes back is stored as a reply and delivered in turn. Two
-local numbers can hold a whole conversation with no Twilio anywhere.
+Phone panel's messages column. **Text**, next to Call on the keypad, starts a conversation
+with whatever number is in the dial box — the messaging counterpart of dialling in, and the
+only way to be a number that has never texted you before. If the destination is a number
+localio holds and it has an `sms_url`, the message is **delivered**: a signed inbound
+messaging webhook goes to that URL, and any `<Message>` in the TwiML that comes back is
+stored as a reply and delivered in turn. Two local numbers can hold a whole conversation
+with no Twilio anywhere.
 
 If the destination is a number localio does not hold, the message is stored as outbound and
 left. Nobody is on the other end, which is what that means.
