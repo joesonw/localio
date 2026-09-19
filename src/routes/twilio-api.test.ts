@@ -917,3 +917,313 @@ test('a placement that was refused announces nothing', async () => {
   assert.equal(response.statusCode, 400);
   assert.deepEqual(seen, []);
 });
+
+/* ------------------------------------------------------- account boundaries */
+
+/**
+ * **A sid is not a capability.**
+ *
+ * Every `:sid` route used to find its row globally and hand it back to whoever was
+ * authenticated, so any account could read any other account's calls, recordings and
+ * message bodies by naming a sid — and a sid is exactly the thing an application knows,
+ * because it was answered to somebody. Twilio's answer across that boundary is `20404`:
+ * over there it does not exist. `404` rather than `403` is the point — a `403` confirms
+ * the sid is real.
+ */
+test('a resource of another account is a 20404, not a row somebody else owns', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+
+  // A second account with a call, a message, a number and a recording of its own.
+  const other = store.accounts.create({ friendlyName: 'someone else' });
+  const otherNumber = store.numbers.create({
+    phoneNumber: '+15558880001',
+    accountSid: other.accountSid,
+  });
+  const otherCall = store.calls.create({
+    accountSid: other.accountSid,
+    from: '+15558880001',
+    to: '+15559999999',
+    direction: 'outbound-api',
+    status: 'queued',
+  });
+  const otherMessage = store.messages.create({
+    accountSid: other.accountSid,
+    from: '+15558880001',
+    to: '+15559999999',
+    body: 'not yours to read',
+    direction: 'outbound-api',
+  });
+
+  const paths = [
+    `${API}/Accounts/${accountSid}/Calls/${otherCall.sid}.json`,
+    `${API}/Accounts/${accountSid}/Messages/${otherMessage.sid}.json`,
+    `${API}/Accounts/${accountSid}/IncomingPhoneNumbers/${otherNumber.sid}.json`,
+    `${API}/Accounts/${accountSid}/Calls/${otherCall.sid}/Recordings.json`,
+  ];
+
+  for (const url of paths) {
+    const response = await server.app.inject({ method: 'GET', url, headers: { authorization: auth } });
+    assert.equal(response.statusCode, 404, url);
+    assert.equal(response.json().code, 20404, url);
+  }
+
+  // And the body never comes back by another door.
+  const message = await server.app.inject({
+    method: 'GET',
+    url: `${API}/Accounts/${accountSid}/Messages/${otherMessage.sid}.json`,
+    headers: { authorization: auth },
+  });
+  assert.ok(!message.body.includes('not yours to read'));
+
+  await server.close();
+});
+
+/** A write across the boundary is refused the same way, and changes nothing. */
+test('a number owned by another account cannot be updated or released', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const other = store.accounts.create({ friendlyName: 'someone else' });
+  const theirs = store.numbers.create({
+    phoneNumber: '+15558880002',
+    accountSid: other.accountSid,
+    voiceUrl: 'http://theirs.test/voice',
+  });
+
+  const update = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers/${theirs.sid}.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'VoiceUrl=http%3A%2F%2Fmine.test%2Fvoice',
+  });
+  assert.equal(update.statusCode, 404);
+  assert.equal(update.json().code, 20404);
+
+  const released = await server.app.inject({
+    method: 'DELETE',
+    url: `${API}/Accounts/${accountSid}/IncomingPhoneNumbers/${theirs.sid}.json`,
+    headers: { authorization: auth },
+  });
+  assert.equal(released.statusCode, 404);
+
+  const after = store.numbers.find(theirs.sid);
+  assert.equal(after?.voiceUrl, 'http://theirs.test/voice', 'untouched');
+  await server.close();
+});
+
+/** The per-message `StatusCallback` survives the round trip onto the row. */
+test('a StatusCallback named on Messages.json is stored against that message', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Messages.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload:
+      'From=%2B15550000001&To=%2B15559999999&Body=hi&StatusCallback=http%3A%2F%2Fapp.test%2Fsms-status',
+  });
+  assert.equal(response.statusCode, 201, response.body);
+  const stored = store.messages.find(response.json().sid);
+  assert.equal(stored?.statusCallbackUrl, 'http://app.test/sms-status');
+  await server.close();
+});
+
+/**
+ * The placement parameters this route used to drop.
+ *
+ * `Twiml`, `Method`, `StatusCallbackMethod` and `StatusCallbackEvent` were all read off
+ * the request and thrown away, so an application that used any of them got a call that
+ * behaved as though it had not — silently.
+ */
+test('a placement keeps the parameters it was given', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Calls.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: [
+      'From=%2B15550000001',
+      'To=%2B15559999999',
+      'Url=http%3A%2F%2Fapp.test%2Fvoice',
+      'Method=GET',
+      'StatusCallback=http%3A%2F%2Fapp.test%2Fstatus',
+      'StatusCallbackMethod=GET',
+      'StatusCallbackEvent=initiated',
+      'StatusCallbackEvent=completed',
+    ].join('&'),
+  });
+  assert.equal(response.statusCode, 201, response.body);
+
+  const call = store.calls.find(response.json().sid);
+  assert.equal(call?.answerMethod, 'GET');
+  assert.equal(call?.statusCallbackMethod, 'GET');
+  assert.deepEqual(call?.statusCallbackEvents, ['initiated', 'completed']);
+  await server.close();
+});
+
+/** Twilio takes inline TwiML in place of a `Url`, and applications under test lean on it. */
+test('inline Twiml is kept as the document the call will be answered with', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Calls.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload:
+      'From=%2B15550000001&To=%2B15559999999&Twiml=%3CResponse%3E%3CSay%3Ehi%3C%2FSay%3E%3C%2FResponse%3E',
+  });
+  assert.equal(response.statusCode, 201, response.body);
+  const call = store.calls.find(response.json().sid);
+  assert.equal(call?.answerTwiml, '<Response><Say>hi</Say></Response>');
+  assert.equal(call?.answerUrl, null, 'and no url, because none was named');
+  await server.close();
+});
+
+/**
+ * An application that never heard of `StatusCallbackEvent` must see exactly what it saw
+ * before the parameter was implemented: one callback, at the end.
+ */
+test('a placement that names no events still defaults to completed alone', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Calls.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'From=%2B15550000001&To=%2B15559999999&Url=http%3A%2F%2Fapp.test%2Fvoice',
+  });
+  const call = store.calls.find(response.json().sid);
+  assert.equal(call?.statusCallbackEvents, null, 'stored as unnamed, not as a guessed list');
+  await server.close();
+});
+
+/** `.update({status: 'canceled'})` on a queued call is the SDK's way to give up on it. */
+test('a call update honours Status rather than answering a fixed in-progress', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const placed = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Calls.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'From=%2B15550000001&To=%2B15559999999&Url=http%3A%2F%2Fapp.test%2Fvoice',
+  });
+  const sid = placed.json().sid;
+
+  const updated = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Calls/${sid}.json`,
+    headers: { authorization: auth, 'content-type': 'application/x-www-form-urlencoded' },
+    payload: 'Status=completed',
+  });
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json().status, 'canceled', 'a queued call asked to end is canceled');
+  assert.equal(store.calls.find(sid)?.status, 'canceled');
+  await server.close();
+});
+
+/* ------------------------------------------------------------- pagination */
+
+/**
+ * **`next_page_uri` is what the SDK's auto-paginator walks.** Without one,
+ * `client.messages.list()` stops after the first page and reports a truncated set as the
+ * whole of it — a wrong answer that looks exactly like a right one.
+ */
+test('a list carries the envelope the SDK paginates with', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  for (let i = 0; i < 5; i += 1) {
+    store.messages.create({
+      accountSid,
+      from: '+15550000001',
+      to: '+15559999999',
+      body: `message ${i}`,
+      direction: 'outbound-api',
+    });
+  }
+
+  const first = (
+    await server.app.inject({
+      url: `${API}/Accounts/${accountSid}/Messages.json?PageSize=2`,
+      headers: { authorization: auth },
+    })
+  ).json();
+
+  assert.equal(first.messages.length, 2);
+  assert.equal(first.page, 0);
+  assert.equal(first.page_size, 2, 'the size asked for, not the number returned');
+  assert.equal(first.start, 0);
+  assert.equal(first.end, 1);
+  assert.equal(first.previous_page_uri, null);
+  assert.ok(first.next_page_uri, 'there is more');
+
+  // Walk it the way the paginator does, and expect to see every row exactly once.
+  const seen: string[] = [];
+  let next: string | null = first.next_page_uri;
+  for (const message of first.messages) seen.push(message.sid);
+  while (next !== null) {
+    const page = (
+      await server.app.inject({ url: next, headers: { authorization: auth } })
+    ).json();
+    for (const message of page.messages) seen.push(message.sid);
+    next = page.next_page_uri;
+  }
+
+  assert.equal(seen.length, 5);
+  assert.equal(new Set(seen).size, 5, 'no row seen twice');
+  await server.close();
+});
+
+/**
+ * The limit used to be pushed into the store query and applied *before* the account
+ * filter, so another account's rows consumed the page and this account's came back short
+ * — or empty, with nothing saying more existed.
+ */
+test('another account rows do not consume this account page', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const other = store.accounts.create({ friendlyName: 'noisy' });
+  for (let i = 0; i < 60; i += 1) {
+    store.messages.create({
+      accountSid: other.accountSid,
+      from: '+15558880001',
+      to: '+15559999999',
+      body: 'theirs',
+      direction: 'outbound-api',
+    });
+  }
+  store.messages.create({
+    accountSid,
+    from: '+15550000001',
+    to: '+15559999999',
+    body: 'mine',
+    direction: 'outbound-api',
+  });
+
+  const body = (
+    await server.app.inject({
+      url: `${API}/Accounts/${accountSid}/Messages.json`,
+      headers: { authorization: auth },
+    })
+  ).json();
+  assert.equal(body.messages.length, 1, 'the one row this account has');
+  assert.equal(body.messages[0].body, 'mine');
+  await server.close();
+});
+
+/** `subresource_uris` must point at routes that exist, or the SDK walks into the 501. */
+test('the media subresource a message advertises is a real route', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const message = store.messages.create({
+    accountSid,
+    from: '+15550000001',
+    to: '+15559999999',
+    body: 'hi',
+    direction: 'outbound-api',
+  });
+  const resource = (
+    await server.app.inject({
+      url: `${API}/Accounts/${accountSid}/Messages/${message.sid}.json`,
+      headers: { authorization: auth },
+    })
+  ).json();
+
+  const media = await server.app.inject({
+    url: resource.subresource_uris.media,
+    headers: { authorization: auth },
+  });
+  assert.equal(media.statusCode, 200, media.body);
+  assert.deepEqual(media.json().media_list, []);
+  await server.close();
+});

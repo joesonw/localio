@@ -73,16 +73,43 @@ export class LocalioServer {
     const poster = new WebhookPoster({ timeoutMs: config.webhookTimeoutMs, logger });
     const sms = new SmsService({ store, poster, config, logger });
     const liveCallSids = () => new Set([...this.sessions].map((s) => s.sid).filter(Boolean));
+    // `POST Calls/:sid.json` with `Status=completed` reaches the session this way. It
+    // goes through the same `hangupFromPage` the handset's own Hang up does, so there is
+    // still exactly one teardown and one status callback.
+    const endCall = (sid: string): boolean => {
+      const session = [...this.sessions].find((s) => s.sid === sid);
+      if (session === undefined) return false;
+      session.hangupFromPage();
+      return true;
+    };
 
     void this.app.register(formbody);
     void this.app.register(websocket);
 
     void this.app.register(async (instance) => {
       registerAdmin(instance, store);
-      registerApp(instance, { store, sms, config, liveCallSids, claims: this.claims, feed: this.feed });
+      registerApp(instance, {
+        store,
+        sms,
+        config,
+        logger,
+        poster,
+        liveCallSids,
+        claims: this.claims,
+        feed: this.feed,
+      });
       // Registers its own `501` catch-all last, internally. See the header.
-      registerTwilioApi(instance, { store, sms, config, logger, liveCallSids, feed: this.feed });
-      this.registerControl(instance, poster);
+      registerTwilioApi(instance, {
+        store,
+        sms,
+        config,
+        logger,
+        poster,
+        liveCallSids,
+        endCall,
+        feed: this.feed,
+      });
+      this.registerControl(instance, poster, sms);
     });
 
     void this.app.register(fastifyStatic, {
@@ -100,7 +127,7 @@ export class LocalioServer {
    * that belongs to it. Binary frames are the microphone and nothing else — text frames
    * are control — which is the whole of the framing on this wire.
    */
-  private registerControl(instance: FastifyInstance, poster: WebhookPoster): void {
+  private registerControl(instance: FastifyInstance, poster: WebhookPoster, sms: SmsService): void {
     instance.get('/control', { websocket: true }, (socket: WebSocket) => {
       const { store, config, logger } = this.options;
       let session: CallSession | null = null;
@@ -120,6 +147,7 @@ export class LocalioServer {
             const started = new CallSession({
               store,
               poster,
+              sms,
               config,
               logger,
               client: socket,

@@ -12,7 +12,6 @@ export interface PhoneNumber {
   statusCallbackMethod: string;
   smsUrl: string | null;
   smsMethod: string;
-  smsStatusCallbackUrl: string | null;
   createdAt: number;
 }
 
@@ -27,7 +26,6 @@ interface Row {
   status_callback_method: string;
   sms_url: string | null;
   sms_method: string;
-  sms_status_callback_url: string | null;
   created_at: number;
 }
 
@@ -43,7 +41,6 @@ function hydrate(row: Row): PhoneNumber {
     statusCallbackMethod: row.status_callback_method,
     smsUrl: row.sms_url,
     smsMethod: row.sms_method,
-    smsStatusCallbackUrl: row.sms_status_callback_url,
     createdAt: row.created_at,
   };
 }
@@ -59,7 +56,6 @@ export interface NumberInput {
   statusCallbackMethod?: string;
   smsUrl?: string | null;
   smsMethod?: string;
-  smsStatusCallbackUrl?: string | null;
 }
 
 /** Everything a `PATCH` may change. The number itself and its account are not on this list. */
@@ -106,7 +102,6 @@ export class PhoneNumbers {
       statusCallbackMethod: input.statusCallbackMethod ?? 'POST',
       smsUrl: input.smsUrl ?? null,
       smsMethod: input.smsMethod ?? 'POST',
-      smsStatusCallbackUrl: input.smsStatusCallbackUrl ?? null,
       createdAt: now(),
     };
     this.db
@@ -114,11 +109,11 @@ export class PhoneNumbers {
         `INSERT INTO phone_numbers (
            sid, account_sid, phone_number, friendly_name,
            voice_url, voice_method, status_callback_url, status_callback_method,
-           sms_url, sms_method, sms_status_callback_url, created_at
+           sms_url, sms_method, created_at
          ) VALUES (
            @sid, @accountSid, @phoneNumber, @friendlyName,
            @voiceUrl, @voiceMethod, @statusCallbackUrl, @statusCallbackMethod,
-           @smsUrl, @smsMethod, @smsStatusCallbackUrl, @createdAt
+           @smsUrl, @smsMethod, @createdAt
          )`,
       )
       .run(record);
@@ -209,10 +204,6 @@ export class PhoneNumbers {
       statusCallbackMethod: patch.statusCallbackMethod ?? existing.statusCallbackMethod,
       smsUrl: patch.smsUrl === undefined ? existing.smsUrl : patch.smsUrl,
       smsMethod: patch.smsMethod ?? existing.smsMethod,
-      smsStatusCallbackUrl:
-        patch.smsStatusCallbackUrl === undefined
-          ? existing.smsStatusCallbackUrl
-          : patch.smsStatusCallbackUrl,
     };
     this.db
       .prepare(
@@ -221,8 +212,7 @@ export class PhoneNumbers {
            voice_url = @voiceUrl, voice_method = @voiceMethod,
            status_callback_url = @statusCallbackUrl,
            status_callback_method = @statusCallbackMethod,
-           sms_url = @smsUrl, sms_method = @smsMethod,
-           sms_status_callback_url = @smsStatusCallbackUrl
+           sms_url = @smsUrl, sms_method = @smsMethod
          WHERE sid = @sid`,
       )
       .run(next);

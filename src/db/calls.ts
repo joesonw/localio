@@ -19,7 +19,19 @@ export interface Call {
   direction: 'inbound' | 'outbound-api';
   status: CallStatus;
   answerUrl: string | null;
+  /** Inline TwiML from the placement, which Twilio takes instead of a `Url`. */
+  answerTwiml: string | null;
+  answerMethod: string;
   statusCallbackUrl: string | null;
+  statusCallbackMethod: string;
+  /**
+   * The `StatusCallbackEvent`s this placement asked for, or `null` for none named.
+   *
+   * **`null` is not the same as an empty list** — Twilio reads an unnamed set as
+   * `completed` only, and that default is resolved on read so a stored row can never
+   * disagree with the version of it the code believes in.
+   */
+  statusCallbackEvents: string[] | null;
   startTime: number | null;
   endTime: number | null;
   durationSec: number | null;
@@ -42,11 +54,32 @@ interface Row {
   direction: string;
   status: string;
   answer_url: string | null;
+  answer_twiml: string | null;
+  answer_method: string;
   status_callback_url: string | null;
+  status_callback_method: string;
+  status_callback_events: string | null;
   start_time: number | null;
   end_time: number | null;
   duration_sec: number | null;
   created_at: number;
+}
+
+/**
+ * The stored event list, which is JSON and therefore could be anything.
+ *
+ * Decoded rather than trusted: a row written by an older build, or by hand, must not be
+ * able to throw on a read. Anything unreadable reads as "none named", which is the same
+ * as the common case and ends in Twilio's default.
+ */
+function parseEvents(raw: string | null): string[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : null;
+  } catch {
+    return null;
+  }
 }
 
 function hydrate(row: Row): Call {
@@ -58,7 +91,11 @@ function hydrate(row: Row): Call {
     direction: row.direction as Call['direction'],
     status: row.status as CallStatus,
     answerUrl: row.answer_url,
+    answerTwiml: row.answer_twiml,
+    answerMethod: row.answer_method,
     statusCallbackUrl: row.status_callback_url,
+    statusCallbackMethod: row.status_callback_method,
+    statusCallbackEvents: parseEvents(row.status_callback_events),
     startTime: row.start_time,
     endTime: row.end_time,
     durationSec: row.duration_sec,
@@ -73,7 +110,11 @@ export interface CreateCall {
   direction: 'inbound' | 'outbound-api';
   status: CallStatus;
   answerUrl?: string | null;
+  answerTwiml?: string | null;
+  answerMethod?: string;
   statusCallbackUrl?: string | null;
+  statusCallbackMethod?: string;
+  statusCallbackEvents?: string[] | null;
   /** Adopt a sid rather than mint one. Used by nothing yet, and deliberately available. */
   sid?: string;
 }
@@ -103,7 +144,11 @@ export class Calls {
       direction: input.direction,
       status: input.status,
       answerUrl: input.answerUrl ?? null,
+      answerTwiml: input.answerTwiml ?? null,
+      answerMethod: input.answerMethod ?? 'POST',
       statusCallbackUrl: input.statusCallbackUrl ?? null,
+      statusCallbackMethod: input.statusCallbackMethod ?? 'POST',
+      statusCallbackEvents: input.statusCallbackEvents ?? null,
       startTime: null,
       endTime: null,
       durationSec: null,
@@ -113,13 +158,21 @@ export class Calls {
       .prepare(
         `INSERT INTO calls (
            sid, account_sid, from_number, to_number, direction, status,
-           answer_url, status_callback_url, start_time, end_time, duration_sec, created_at
+           answer_url, answer_twiml, answer_method,
+           status_callback_url, status_callback_method, status_callback_events,
+           start_time, end_time, duration_sec, created_at
          ) VALUES (
            @sid, @accountSid, @from, @to, @direction, @status,
-           @answerUrl, @statusCallbackUrl, @startTime, @endTime, @durationSec, @createdAt
+           @answerUrl, @answerTwiml, @answerMethod,
+           @statusCallbackUrl, @statusCallbackMethod, @statusCallbackEvents,
+           @startTime, @endTime, @durationSec, @createdAt
          )`,
       )
-      .run(call);
+      .run({
+        ...call,
+        statusCallbackEvents:
+          call.statusCallbackEvents === null ? null : JSON.stringify(call.statusCallbackEvents),
+      });
     return call;
   }
 
@@ -177,6 +230,22 @@ export class Calls {
         .prepare(`UPDATE calls SET status = 'canceled' WHERE sid = ? AND status = 'queued'`)
         .run(sid).changes === 1
     );
+  }
+
+  /**
+   * The next `SequenceNumber` for this call's status callbacks, 0-based.
+   *
+   * **On the row rather than in the session**, because the first event a placed call
+   * emits (`initiated`) is posted from the REST route before any session exists, and the
+   * rest come from the session. Two counters would number the same call twice from zero,
+   * and `SequenceNumber` is precisely what an application uses to order callbacks that
+   * arrived out of order.
+   */
+  nextCallbackSeq(sid: string): number {
+    const row = this.db
+      .prepare('UPDATE calls SET callback_seq = callback_seq + 1 WHERE sid = ? RETURNING callback_seq')
+      .get(sid) as { callback_seq: number } | undefined;
+    return row === undefined ? 0 : row.callback_seq - 1;
   }
 
   markInProgress(sid: string): void {

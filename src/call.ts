@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 import { WebSocket } from 'ws';
 import { CallClaims } from './call-claims.js';
 import type { CallFeed } from './call-feed.js';
+import { postCallStatus, type CallEventName, type CallStatusDeps } from './call-status.js';
 import type { Config } from './config.js';
 import {
   encodeControlEvent,
@@ -13,6 +14,7 @@ import type { Account, PhoneNumber, Store } from './db/index.js';
 import { mulawToPcm16, pcm16ToMulaw } from './g711.js';
 import { providerId } from './provider-id.js';
 import { Recorder } from './recorder.js';
+import type { SmsService } from './sms.js';
 import {
   decodeAudio,
   decodeGatewayFrame,
@@ -33,7 +35,6 @@ import {
 import { SAMPLE_RATE, wavToLineFormat } from './wav.js';
 import {
   recordingForm,
-  statusForm,
   voiceForm,
   type CallFacts,
   type WebhookPoster,
@@ -61,6 +62,8 @@ import {
 export interface CallSessionOptions {
   store: Store;
   poster: WebhookPoster;
+  /** So a `<Message>` in a voice document is delivered rather than merely stored. */
+  sms: SmsService;
   config: Config;
   logger: Logger;
   client: WebSocket;
@@ -75,6 +78,7 @@ const FRAME_BYTES = (SAMPLE_RATE / 50) * 2;
 export class CallSession implements ExecutionHost {
   private readonly store: Store;
   private readonly poster: WebhookPoster;
+  private readonly sms: SmsService;
   private readonly config: Config;
   private readonly logger: Logger;
   private readonly client: WebSocket;
@@ -99,11 +103,19 @@ export class CallSession implements ExecutionHost {
 
   private connected = false;
   private closed = false;
+  /**
+   * Set when this session took a *queued* row, so `dial()` can report `ringing`.
+   *
+   * Only a placed call has that transition: an inbound one is created `ringing` and is
+   * `in-progress` on the next line, because the handset dialling *is* the call arriving.
+   */
+  private ringingPending = false;
   private finalStatus: 'completed' | 'busy' | 'no-answer' | 'failed' = 'completed';
 
   constructor(options: CallSessionOptions) {
     this.store = options.store;
     this.poster = options.poster;
+    this.sms = options.sms;
     this.config = options.config;
     this.logger = options.logger;
     this.client = options.client;
@@ -146,8 +158,15 @@ export class CallSession implements ExecutionHost {
       direction: this.direction,
     });
 
-    const answerUrl = this.answerUrl();
-    if (!answerUrl) {
+    // After `resolveAccount`, which is what put a token in hand to sign with.
+    if (this.ringingPending) {
+      this.ringingPending = false;
+      await this.progress('ringing', 'ringing');
+    }
+
+    const inline = this.answerTwiml();
+    const answerUrl = inline ? '' : this.answerUrl();
+    if (!inline && !answerUrl) {
       this.fail(
         'no_voice_url',
         `${this.ourNumber?.phoneNumber ?? 'that number'} has no voice_url — set one in the Numbers panel`,
@@ -155,13 +174,19 @@ export class CallSession implements ExecutionHost {
       return;
     }
 
-    const result = await this.poster.post(
-      answerUrl,
-      this.authToken,
-      voiceForm(this.facts()),
-      (this.ourNumber?.voiceMethod ?? 'POST') === 'GET' ? 'GET' : 'POST',
-      { kind: 'voice', callSid: this.callSid },
-    );
+    // Inline TwiML is presented as a webhook that answered 200, because to everything
+    // downstream — the executor, the event log, the page — that is exactly what it is.
+    // The alternative is a second shape of "where the document came from" threaded
+    // through all three.
+    const result = inline
+      ? { status: 200, body: inline, url: 'twiml:inline', params: {}, method: 'POST' as const, durationMs: 0 }
+      : await this.poster.post(
+          answerUrl,
+          this.authToken,
+          voiceForm(this.facts()),
+          this.voiceMethod(),
+          { kind: 'voice', callSid: this.callSid },
+        );
     this.store.calls.log(this.callSid, 'webhook', {
       kind: 'voice',
       status: result.status,
@@ -196,6 +221,7 @@ export class CallSession implements ExecutionHost {
     }
 
     this.store.calls.markInProgress(this.callSid);
+    await this.progress('answered', 'in-progress');
     this.store.calls.log(this.callSid, 'twiml', { verbs: twiml.verbs.map((v) => v.name) });
     // The call has reached a document, which is the point past which a status callback is
     // owed — see `end`.
@@ -244,6 +270,7 @@ export class CallSession implements ExecutionHost {
     // still, because the conditional UPDATE above is what actually decided it.
     this.feed.publish({ kind: 'taken', call, claimedBy: null });
     this.callSid = call.sid;
+    this.ringingPending = true;
     this.from = call.from;
     this.to = call.to;
     this.direction = 'outbound-api';
@@ -319,6 +346,27 @@ export class CallSession implements ExecutionHost {
     return call?.answerUrl || this.ourNumber?.voiceUrl || '';
   }
 
+  /**
+   * Inline TwiML from the placement, if it named any.
+   *
+   * Twilio's `Calls.json` takes `Twiml` *instead of* `Url`, and applications under test
+   * reach for it constantly because it needs no server. It short-circuits the whole
+   * webhook: there is nothing to post to and nothing to sign, so the document is simply
+   * the one that was handed over.
+   */
+  private answerTwiml(): string {
+    return this.store.calls.find(this.callSid)?.answerTwiml ?? '';
+  }
+
+  /** The placement's `Method`, falling back to the number's standing `voice_method`. */
+  private voiceMethod(): 'GET' | 'POST' {
+    const call = this.store.calls.find(this.callSid);
+    // The call row first: a placed call's `From` may be a number this simulator does not
+    // hold, in which case there is no `ourNumber` to read a method off at all.
+    const raw = call?.answerUrl ? call.answerMethod : (this.ourNumber?.voiceMethod ?? 'POST');
+    return raw === 'GET' ? 'GET' : 'POST';
+  }
+
   private facts(): CallFacts {
     return {
       callSid: this.callSid,
@@ -327,6 +375,30 @@ export class CallSession implements ExecutionHost {
       to: this.to,
       direction: this.direction,
     };
+  }
+
+  private statusDeps(): CallStatusDeps {
+    return { store: this.store, poster: this.poster, logger: this.logger };
+  }
+
+  /**
+   * Report one call-progress event, if the placement asked for it.
+   *
+   * The row is read back rather than held, because `statusCallbackEvents` and the
+   * sequence counter both live on it and both are written elsewhere. `postCallStatus`
+   * decides whether anything is actually sent.
+   */
+  private async progress(event: CallEventName, status: string): Promise<void> {
+    if (!this.callSid) return;
+    const call = this.store.calls.find(this.callSid);
+    if (call === null) return;
+    await postCallStatus(this.statusDeps(), {
+      call,
+      event,
+      status,
+      authToken: this.authToken,
+      fallbackUrl: this.ourNumber?.statusCallbackUrl ?? null,
+    });
   }
 
   /* -------------------------------------------------------- the execution host */
@@ -579,18 +651,34 @@ export class CallSession implements ExecutionHost {
     return wavToLineFormat(Buffer.from(await response.arrayBuffer()));
   }
 
+  /**
+   * `<Message>` inside a *voice* document: an SMS sent during a call.
+   *
+   * **Delivered, not merely recorded.** It goes through the same {@link SmsService} a
+   * `POST …/Messages.json` does, so it reaches the destination's `sms_url` and can be
+   * replied to — which is what Twilio does with it, and what the identical verb in a
+   * *messaging* document here already did. Writing the row directly, as this used to,
+   * made the same TwiML mean two different things depending on which kind of document it
+   * arrived in, with nothing saying so.
+   *
+   * Defaults are Twilio's: to the other party, from the number the call is on.
+   */
   async sendMessage(body: string, to: string | undefined, from: string | undefined): Promise<void> {
-    // A `<Message>` inside a *voice* document is an SMS sent during a call. Defaults are
-    // Twilio's: to the other party, from the number the call is on.
     const target = to ?? (this.direction === 'inbound' ? this.from : this.to);
     const sender = from ?? (this.ourNumber?.phoneNumber ?? this.to);
-    this.store.messages.create({
-      accountSid: this.accountSid,
+    const result = await this.sms.send({
       from: sender,
       to: target,
       body,
+      accountSid: this.accountSid,
       direction: 'outbound-reply',
-      status: 'sent',
+    });
+    this.store.calls.log(this.callSid, 'verb', {
+      verb: 'Message',
+      messageSid: result.message.sid,
+      to: target,
+      status: result.message.status,
+      note: result.note,
     });
   }
 
@@ -601,9 +689,10 @@ export class CallSession implements ExecutionHost {
   /**
    * `<Reject>`: the call is refused before it ever connects.
    *
-   * **No status callback**, which is the difference from `<Hangup>`. Twilio does not
-   * report a call that was rejected as one that completed, and neither does this — see
-   * `end`, where `connected` is what decides.
+   * The status callback **is** posted, carrying `busy` or `no-answer`. That is Twilio's
+   * behaviour and the reverse of what this used to do: a refused call is an outcome an
+   * application needs to hear about, and it is exactly the outcome it cannot observe any
+   * other way.
    */
   async reject(reason: string): Promise<void> {
     this.connected = false;
@@ -791,10 +880,16 @@ export class CallSession implements ExecutionHost {
    * that never answered and a document that ran out all land here. A second way to finish
    * a call is a call that either never posts its status callback or posts it twice.
    *
-   * **The status callback is posted only for a call that reached a document.** A voice
-   * webhook that answered 403 or 404 was never a call at Twilio either, and telling the
-   * application that one completed would be inventing a call it had already refused. A
-   * `<Reject>` clears the same flag, for the same reason.
+   * **The `completed` callback is posted for every call that ended**, whatever it ended
+   * as — `completed`, `busy`, `no-answer` or `failed` — because that is what Twilio does
+   * and because `CallStatus` on it already says which. It used to be withheld from any
+   * call that never reached a document, on the reasoning that nothing had connected; the
+   * cost was that an application waiting on the callback to release a seat or stop a
+   * timer waited forever, with "nothing arrived" indistinguishable from "still up".
+   *
+   * It is still gated on the placement's `StatusCallbackEvent` set, which defaults to
+   * `completed` — so an application that asked for nothing in particular sees exactly
+   * this one callback, as before.
    */
   async end(reason: string): Promise<void> {
     if (this.closed) return;
@@ -815,21 +910,21 @@ export class CallSession implements ExecutionHost {
 
     const call = this.callSid ? this.store.calls.finish(this.callSid, this.finalStatus) : null;
 
-    if (this.connected && call !== null) {
-      const url = call.statusCallbackUrl || this.ourNumber?.statusCallbackUrl || '';
-      if (url) {
-        const answer = await this.poster.post(
-          url,
-          this.authToken,
-          statusForm({ ...this.facts(), durationSeconds: call.durationSec ?? 0, status: this.finalStatus }),
-          (this.ourNumber?.statusCallbackMethod ?? 'POST') === 'GET' ? 'GET' : 'POST',
-          { kind: 'status', callSid: this.callSid },
-        );
-        this.store.calls.log(this.callSid, 'webhook', {
-          kind: 'status',
-          status: answer.status,
-          url: answer.url,
-        });
+    if (call !== null) {
+      // **Posted for every call that ended, not only for one that connected.** Twilio
+      // sends a completed-call callback for `busy`, `no-answer`, `canceled` and `failed`
+      // too — an application waiting on one to release a seat, stop a timer or bill a
+      // leg waits forever otherwise, and "nothing arrived" is indistinguishable from
+      // "the call is still up". The `CallStatus` on it says which of those it was.
+      const answer = await postCallStatus(this.statusDeps(), {
+        call,
+        event: 'completed',
+        status: this.finalStatus,
+        authToken: this.authToken,
+        fallbackUrl: this.ourNumber?.statusCallbackUrl ?? null,
+        durationSeconds: call.durationSec ?? 0,
+      });
+      if (answer !== null) {
         this.send({
           type: 'webhook',
           kind: 'status',

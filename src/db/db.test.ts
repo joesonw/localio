@@ -21,8 +21,36 @@ function seeded(): { store: Store; accountSid: string } {
 
 test('the migration runs on an empty database and is idempotent', () => {
   const s = store();
-  assert.equal(s.db.pragma('user_version', { simple: true }), 3);
+  assert.equal(s.db.pragma('user_version', { simple: true }), 4);
   assert.deepEqual(s.accounts.list(), []);
+});
+
+/**
+ * Step 4 is the one that moved the SMS status callback off the number and onto the
+ * message. The *absence* is half the point: a reader who finds a column on
+ * `phone_numbers` will use it, and Twilio has no such field — so this asserts the ladder
+ * left nothing behind for that reader to find.
+ */
+test('migration 4 puts the status callback on the message and takes it off the number', () => {
+  const s = store();
+  const columns = (table: string): string[] =>
+    (s.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((c) => c.name);
+
+  assert.ok(columns('messages').includes('status_callback_url'));
+  assert.ok(columns('messages').includes('messaging_service_sid'));
+  assert.ok(
+    !columns('phone_numbers').includes('sms_status_callback_url'),
+    'a number has no SMS status callback, because Twilio has none',
+  );
+  for (const column of [
+    'answer_twiml',
+    'answer_method',
+    'status_callback_method',
+    'status_callback_events',
+    'callback_seq',
+  ]) {
+    assert.ok(columns('calls').includes(column), `calls.${column}`);
+  }
 });
 
 /* ---------------------------------------------------------------- subaccounts */

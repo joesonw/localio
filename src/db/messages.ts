@@ -14,6 +14,16 @@ export interface Message {
   status: MessageStatus;
   numSegments: number;
   errorCode: number | null;
+  /**
+   * Where this message's delivery status is reported, named by whoever sent it.
+   *
+   * **Per message, because that is Twilio's shape.** `StatusCallback` is a parameter on
+   * `POST …/Messages.json`, not a setting on a number — and the callback is the sender's,
+   * describing their own outbound message, so it is signed with the *sender's* auth token.
+   */
+  statusCallbackUrl: string | null;
+  /** Echoed back on the resource. Only set when the placement actually named one. */
+  messagingServiceSid: string | null;
   createdAt: number;
 }
 
@@ -27,6 +37,8 @@ interface Row {
   status: string;
   num_segments: number;
   error_code: number | null;
+  status_callback_url: string | null;
+  messaging_service_sid: string | null;
   created_at: number;
 }
 
@@ -41,6 +53,8 @@ function hydrate(row: Row): Message {
     status: row.status as MessageStatus,
     numSegments: row.num_segments,
     errorCode: row.error_code,
+    statusCallbackUrl: row.status_callback_url,
+    messagingServiceSid: row.messaging_service_sid,
     createdAt: row.created_at,
   };
 }
@@ -79,6 +93,8 @@ export class Messages {
     direction: MessageDirection;
     status?: MessageStatus;
     sid?: string;
+    statusCallbackUrl?: string | null;
+    messagingServiceSid?: string | null;
   }): Message {
     const message: Message = {
       sid: input.sid ?? providerId('SM'),
@@ -90,16 +106,20 @@ export class Messages {
       status: input.status ?? (input.direction === 'inbound' ? 'received' : 'queued'),
       numSegments: segmentCount(input.body),
       errorCode: null,
+      statusCallbackUrl: input.statusCallbackUrl ?? null,
+      messagingServiceSid: input.messagingServiceSid ?? null,
       createdAt: now(),
     };
     this.db
       .prepare(
         `INSERT INTO messages (
            sid, account_sid, from_number, to_number, body,
-           direction, status, num_segments, error_code, created_at
+           direction, status, num_segments, error_code,
+           status_callback_url, messaging_service_sid, created_at
          ) VALUES (
            @sid, @accountSid, @from, @to, @body,
-           @direction, @status, @numSegments, @errorCode, @createdAt
+           @direction, @status, @numSegments, @errorCode,
+           @statusCallbackUrl, @messagingServiceSid, @createdAt
          )`,
       )
       .run(message);

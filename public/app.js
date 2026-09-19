@@ -443,7 +443,6 @@ function numberCard(number) {
     ['voice', number.voice_url ? `${number.voice_method} ${number.voice_url}` : null],
     ['status', number.status_callback_url],
     ['sms', number.sms_url ? `${number.sms_method} ${number.sms_url}` : null],
-    ['sms status', number.sms_status_callback_url],
     ['account', accountLabel(number.account_sid)],
   ]) {
     body.append(el('dt', '', label), el('dd', '', value ?? '— not set'));
@@ -527,7 +526,6 @@ function numberEditor(number) {
 
   const rowThree = el('div', 'fields');
   rowThree.append(field('sms_url', 'sms url', number.sms_url), picker('sms_method', number.sms_method));
-  rowThree.append(field('sms_status_callback_url', 'sms status callback', number.sms_status_callback_url));
   form.append(rowThree);
 
   const actions = el('div', 'actions');
@@ -575,7 +573,6 @@ document.getElementById('number-form').addEventListener('submit', async (event) 
     status_callback_url: document.getElementById('n-status').value,
     sms_url: document.getElementById('n-sms').value,
     sms_method: document.getElementById('n-sms-method').value,
-    sms_status_callback_url: document.getElementById('n-sms-status').value,
   };
   if (!body.account_sid) {
     showError('number-error', new Error('create an account first — a number has to be held by one'));
@@ -584,7 +581,7 @@ document.getElementById('number-form').addEventListener('submit', async (event) 
   try {
     showError('number-error', null);
     await api('/admin/numbers', { method: 'POST', body });
-    for (const id of ['n-number', 'n-name', 'n-voice', 'n-status', 'n-sms', 'n-sms-status']) {
+    for (const id of ['n-number', 'n-name', 'n-voice', 'n-status', 'n-sms']) {
       document.getElementById(id).value = '';
     }
     await loadNumbers();

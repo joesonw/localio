@@ -3,10 +3,12 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Logger } from 'pino';
 import type { CallFeed } from '../call-feed.js';
+import { parseEventRequest, postCallStatus } from '../call-status.js';
 import type { Config } from '../config.js';
 import { preview } from '../log.js';
 import type { Account, AccountStatus, ApiKey, Call, Message, PhoneNumber, Recording, Store } from '../db/index.js';
 import type { SmsService } from '../sms.js';
+import type { WebhookPoster } from '../webhook.js';
 
 /**
  * The Twilio REST API, faked.
@@ -51,15 +53,66 @@ interface Deps {
   sms: SmsService;
   config: Config;
   logger: Logger;
+  /** For the call-progress callbacks this file posts itself — `initiated`, and nothing else. */
+  poster: WebhookPoster;
   /** Calls currently up, so `getCall` can report a duration that is still moving. */
   liveCallSids: () => Set<string>;
   /** Advisory push, so the Phone panel sees a placed call without waiting for its poll. */
   feed: CallFeed;
+  /** End a live call from outside its socket. False when no session holds that sid. */
+  endCall: (sid: string) => boolean;
 }
 
 /** Twilio's error envelope. Every refusal in this file wears it. */
 function twilioError(reply: FastifyReply, status: number, code: number, message: string): void {
   void reply.code(status).send({ code, message, more_info: `https://www.twilio.com/docs/errors/${code}`, status });
+}
+
+/**
+ * Twilio's list envelope, which the SDK's auto-paginator actually walks.
+ *
+ * **`next_page_uri` is the load-bearing field.** `client.messages.list()` follows it until
+ * it is null; without one it stops after a single page and reports a truncated set as the
+ * whole of it, which is a wrong answer that looks like a right one. The five list routes
+ * here used to emit `{page, page_size, uri}` and nothing else, with `page_size` set to the
+ * number of rows *returned* rather than the page size asked for — so a short last page
+ * read as a smaller request.
+ *
+ * `start` and `end` are inclusive 0-based indices into the whole result set, as at Twilio.
+ */
+function pageEnvelope<T>(
+  key: string,
+  path: string,
+  rows: T[],
+  page: number,
+  pageSize: number,
+): Record<string, unknown> {
+  const start = page * pageSize;
+  const slice = rows.slice(start, start + pageSize);
+  const hasMore = start + slice.length < rows.length;
+  const at = (n: number): string => `${path}?PageSize=${pageSize}&Page=${n}`;
+  return {
+    [key]: slice,
+    page,
+    page_size: pageSize,
+    start,
+    // Inclusive, so an empty page reports the index it would have started at.
+    end: start + Math.max(slice.length - 1, 0),
+    uri: at(page),
+    first_page_uri: at(0),
+    previous_page_uri: page > 0 ? at(page - 1) : null,
+    next_page_uri: hasMore ? at(page + 1) : null,
+  };
+}
+
+/** `PageSize` and `Page` off the query string, clamped to something a page can hold. */
+function paging(query: { PageSize?: string; Page?: string }): { page: number; pageSize: number } {
+  const size = Number.parseInt(query.PageSize ?? '50', 10);
+  const page = Number.parseInt(query.Page ?? '0', 10);
+  return {
+    pageSize: Number.isFinite(size) && size > 0 ? Math.min(size, 1000) : 50,
+    page: Number.isFinite(page) && page > 0 ? page : 0,
+  };
 }
 
 /** RFC 2822, which is what the SDK's date reader expects. `toUTCString` is exactly it. */
@@ -68,7 +121,7 @@ function rfc2822(seconds: number | null): string | null {
 }
 
 export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
-  const { store, sms, config, logger, feed } = deps;
+  const { store, sms, config, logger, feed, poster, endCall } = deps;
 
   /* ------------------------------------------------------------- the access log */
 
@@ -203,9 +256,14 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       twilioError(reply, 401, 20003, 'Authentication Error - No credentials provided');
       return null;
     }
-    const [user = '', password = ''] = Buffer.from(header.slice(6), 'base64')
-      .toString('utf8')
-      .split(':');
+    // Split on the *first* colon only: a password containing one would otherwise be
+    // truncated at it, and the credential silently becomes a different credential. No
+    // auth token or key secret contains one, which is why this was never a live bug —
+    // but a credential is the one thing worth parsing exactly.
+    const decoded = Buffer.from(header.slice(header.indexOf(' ') + 1), 'base64').toString('utf8');
+    const colon = decoded.indexOf(':');
+    const user = colon === -1 ? decoded : decoded.slice(0, colon);
+    const password = colon === -1 ? '' : decoded.slice(colon + 1);
     const refuse = (): null => {
       twilioError(reply, 401, 20003, 'Authentication Error - invalid username');
       return null;
@@ -273,9 +331,25 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       direction: 'outbound-api',
       status: 'queued',
       answerUrl: body.Url ?? null,
+      // Twilio takes inline TwiML instead of a `Url`. Kept apart rather than folded into
+      // one column, because "answer at this URL" and "answer with this document" are
+      // different instructions and a reader of the row has to be able to tell which.
+      answerTwiml: body.Twiml ?? null,
+      answerMethod: body.Method ?? 'POST',
       statusCallbackUrl: body.StatusCallback ?? null,
+      statusCallbackMethod: body.StatusCallbackMethod ?? 'POST',
+      statusCallbackEvents: parseEventRequest(
+        (request.body as Record<string, unknown> | undefined)?.StatusCallbackEvent,
+      ),
     });
     store.calls.log(call.sid, 'webhook', { kind: 'placed', url: body.Url ?? null });
+    // `initiated` is the first of the four, and it is posted from here rather than from
+    // the session because no session exists yet — the call is registered and waiting.
+    // Most placements never ask for it: Twilio's default set is `completed` alone.
+    await postCallStatus(
+      { store, poster, logger },
+      { call, event: 'initiated', status: 'queued', authToken: account.authToken },
+    );
     // The row is already there, so the strip can draw it now rather than on the page's
     // next two-second poll. Advisory: the poll is still what heals a page that missed it.
     feed.publish({ kind: 'ringing', call, claimedBy: null });
@@ -286,17 +360,24 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid } = request.params as { accountSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const query = request.query as { PageSize?: string; Status?: string };
+    const query = request.query as { PageSize?: string; Page?: string; Status?: string };
+    const { page, pageSize } = paging(query);
+    // Filtered *then* paged. The limit used to be pushed into the store query and applied
+    // before the account filter, so a page could come back short — or empty — while more
+    // of this account's rows matched further down.
     const calls = store.calls
-      .list({ limit: Number.parseInt(query.PageSize ?? '50', 10) || 50 })
+      .list({})
       .filter((call) => call.accountSid === account.accountSid)
       .filter((call) => !query.Status || call.status === query.Status);
-    return reply.send({
-      calls: calls.map((call) => callResource(call, deps)),
-      page: 0,
-      page_size: calls.length,
-      uri: `${API}/Accounts/${account.accountSid}/Calls.json`,
-    });
+    return reply.send(
+      pageEnvelope(
+        'calls',
+        `${API}/Accounts/${account.accountSid}/Calls.json`,
+        calls.map((call) => callResource(call, deps)),
+        page,
+        pageSize,
+      ),
+    );
   });
 
   /**
@@ -311,24 +392,63 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid, callSid } = request.params as { accountSid: string; callSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const call = store.calls.find(callSid);
-    if (call === null) {
-      return twilioError(reply, 404, 20404, `Call ${callSid} was not found`);
-    }
+    const call = owned(reply, account, store.calls.find(callSid), 'Call', callSid);
+    if (!call) return;
     return reply.send(callResource(call, deps));
   });
 
-  /** A TwiML update — Twilio's own transfer. Acknowledged; nothing here redirects a live call yet. */
+  /**
+   * Update a call in flight — the SDK's `.update()`.
+   *
+   * **`Status` is honoured.** `completed` ends a live call and `canceled` drops one that
+   * is still queued, which is how an application hangs up on its own call and the single
+   * most-used operation on this route. Ending it goes through the session's one teardown,
+   * so it posts the status callback and writes the row exactly as any other hang-up does.
+   *
+   * **`Url` and `Twiml` are still only logged**, and that is a real gap rather than a
+   * decision: redirecting a live call means abandoning whatever verb is mid-flight, and
+   * the executor has no cancellation to hang that on. It is logged and answered rather
+   * than refused so the SDK call does not fail, and it is named in the README's list of
+   * what this is not.
+   *
+   * The answer is the row as it now stands, not a fixed `in-progress` — reporting a call
+   * as in-progress immediately after being told to end it is the one answer guaranteed
+   * to be wrong.
+   */
   app.post(`${API}/Accounts/:accountSid/Calls/:callSid.json`, async (request, reply) => {
     const { accountSid, callSid } = request.params as { accountSid: string; callSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const call = store.calls.find(callSid);
-    if (call === null) {
-      return twilioError(reply, 404, 20404, `Call ${callSid} was not found`);
-    }
+    const call = owned(reply, account, store.calls.find(callSid), 'Call', callSid);
+    if (!call) return;
+    const body = (request.body ?? {}) as Record<string, string>;
     store.calls.log(call.sid, 'webhook', { kind: 'update', body: request.body });
-    return reply.send({ ...callResource(call, deps), status: 'in-progress' });
+
+    if (body.Status === 'completed' || body.Status === 'canceled') {
+      // A live call ends through the session, which owns the one teardown and posts the
+      // callback from it. A still-queued one has no session, so the conditional cancel
+      // is the whole of it — and the callback has to be posted here, or a call the
+      // application itself gave up on is the one call it never hears the end of.
+      const live = body.Status === 'completed' && endCall(call.sid);
+      if (!live && store.calls.cancel(call.sid)) {
+        await postCallStatus(
+          { store, poster, logger },
+          {
+            call: store.calls.find(call.sid) ?? call,
+            event: 'completed',
+            status: 'canceled',
+            authToken: account.authToken,
+          },
+        );
+      }
+    } else if (body.Url !== undefined || body.Twiml !== undefined) {
+      logger.warn(
+        { callSid: call.sid },
+        'a call was asked to be redirected, which localio logs but does not do',
+      );
+    }
+
+    return reply.send(callResource(store.calls.find(call.sid) ?? call, deps));
   });
 
   /* ---------------------------------------------------------------- messages */
@@ -343,8 +463,10 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
    * be one value.
    *
    * `status` is `queued` in the answer whatever happened afterwards, because that is what
-   * Twilio can say synchronously. Delivery is reported on the row and, if the number has
-   * an `sms_status_callback_url`, over that.
+   * Twilio can say synchronously. Delivery is reported on the row and, if this request
+   * named a `StatusCallback`, over that — **per message, which is Twilio's shape**. There
+   * is no SMS status callback on a number: `IncomingPhoneNumber` has `sms_url` for inbound
+   * messages and `status_callback` for voice, and nothing for delivery status.
    */
   app.post(`${API}/Accounts/:accountSid/Messages.json`, async (request, reply) => {
     const { accountSid } = request.params as { accountSid: string };
@@ -367,6 +489,8 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       body: body.Body,
       accountSid: account.accountSid,
       direction: 'outbound-api',
+      statusCallbackUrl: body.StatusCallback ?? null,
+      messagingServiceSid: body.MessagingServiceSid ?? null,
     });
     return reply.code(201).send(messageResource({ ...result.message, status: 'queued' }));
   });
@@ -375,20 +499,20 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid } = request.params as { accountSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const query = request.query as { To?: string; From?: string; PageSize?: string };
+    const query = request.query as { To?: string; From?: string; PageSize?: string; Page?: string };
+    const { page, pageSize } = paging(query);
     const messages = store.messages
-      .list({
-        to: query.To,
-        from: query.From,
-        limit: Number.parseInt(query.PageSize ?? '50', 10) || 50,
-      })
+      .list({ to: query.To, from: query.From })
       .filter((message) => message.accountSid === account.accountSid);
-    return reply.send({
-      messages: messages.map((message) => messageResource(message)),
-      page: 0,
-      page_size: messages.length,
-      uri: `${API}/Accounts/${account.accountSid}/Messages.json`,
-    });
+    return reply.send(
+      pageEnvelope(
+        'messages',
+        `${API}/Accounts/${account.accountSid}/Messages.json`,
+        messages.map((message) => messageResource(message)),
+        page,
+        pageSize,
+      ),
+    );
   });
 
   app.get(`${API}/Accounts/:accountSid/Messages/:messageSid.json`, async (request, reply) => {
@@ -398,11 +522,38 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const message = store.messages.find(messageSid);
-    if (message === null) {
-      return twilioError(reply, 404, 20404, `Message ${messageSid} was not found`);
-    }
+    const message = owned(reply, account, store.messages.find(messageSid), 'Message', messageSid);
+    if (!message) return;
     return reply.send(messageResource(message));
+  });
+
+  /**
+   * A message's media, which for a message localio carried is always none.
+   *
+   * Registered because `messageResource` advertises this path in `subresource_uris`, and
+   * an unregistered subresource falls through to the `501` catch-all — so the SDK's
+   * `message.media.list()` failed on a link this very file handed it. An empty list is
+   * the true answer: there is no MMS here, and `num_media` has always said `0`.
+   */
+  app.get(`${API}/Accounts/:accountSid/Messages/:messageSid/Media.json`, async (request, reply) => {
+    const { accountSid, messageSid } = request.params as {
+      accountSid: string;
+      messageSid: string;
+    };
+    const account = authenticate(request, reply, accountSid);
+    if (!account) return;
+    const message = owned(reply, account, store.messages.find(messageSid), 'Message', messageSid);
+    if (!message) return;
+    const { page, pageSize } = paging(request.query as { PageSize?: string; Page?: string });
+    return reply.send(
+      pageEnvelope(
+        'media_list',
+        `${API}/Accounts/${account.accountSid}/Messages/${messageSid}/Media.json`,
+        [],
+        page,
+        pageSize,
+      ),
+    );
   });
 
   /* ----------------------------------------------------------------- numbers */
@@ -430,7 +581,6 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       statusCallbackMethod: body?.StatusCallbackMethod ?? 'POST',
       smsUrl: body?.SmsUrl ?? null,
       smsMethod: body?.SmsMethod ?? 'POST',
-      smsStatusCallbackUrl: body?.SmsStatusCallback ?? null,
     };
     const phoneNumber = body?.PhoneNumber?.trim() ?? '';
     const areaCode = body?.AreaCode?.trim() ?? '';
@@ -479,26 +629,28 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid } = request.params as { accountSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const query = request.query as { PhoneNumber?: string };
+    const query = request.query as { PhoneNumber?: string; PageSize?: string; Page?: string };
+    const { page, pageSize } = paging(query);
     const numbers = store.numbers
       .list(account.accountSid)
       .filter((number) => !query.PhoneNumber || number.phoneNumber === query.PhoneNumber);
-    return reply.send({
-      incoming_phone_numbers: numbers.map(numberResource),
-      page: 0,
-      page_size: numbers.length,
-      uri: `${API}/Accounts/${account.accountSid}/IncomingPhoneNumbers.json`,
-    });
+    return reply.send(
+      pageEnvelope(
+        'incoming_phone_numbers',
+        `${API}/Accounts/${account.accountSid}/IncomingPhoneNumbers.json`,
+        numbers.map(numberResource),
+        page,
+        pageSize,
+      ),
+    );
   });
 
   app.get(`${API}/Accounts/:accountSid/IncomingPhoneNumbers/:sid.json`, async (request, reply) => {
     const { accountSid, sid } = request.params as { accountSid: string; sid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const number = store.numbers.find(sid);
-    if (number === null) {
-      return twilioError(reply, 404, 20404, `IncomingPhoneNumber ${sid} was not found`);
-    }
+    const number = owned(reply, account, store.numbers.find(sid), 'IncomingPhoneNumber', sid);
+    if (!number) return;
     return reply.send(numberResource(number));
   });
 
@@ -507,6 +659,7 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid, sid } = request.params as { accountSid: string; sid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
+    if (!owned(reply, account, store.numbers.find(sid), 'IncomingPhoneNumber', sid)) return;
     const body = (request.body ?? {}) as Record<string, string>;
     const updated = store.numbers.update(sid, {
       friendlyName: body.FriendlyName,
@@ -516,7 +669,6 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       statusCallbackMethod: body.StatusCallbackMethod,
       smsUrl: body.SmsUrl,
       smsMethod: body.SmsMethod,
-      smsStatusCallbackUrl: body.SmsStatusCallback,
     });
     if (updated === null) {
       return twilioError(reply, 404, 20404, `IncomingPhoneNumber ${sid} was not found`);
@@ -528,6 +680,7 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid, sid } = request.params as { accountSid: string; sid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
+    if (!owned(reply, account, store.numbers.find(sid), 'IncomingPhoneNumber', sid)) return;
     if (!store.numbers.remove(sid)) {
       return twilioError(reply, 404, 20404, `IncomingPhoneNumber ${sid} was not found`);
     }
@@ -543,10 +696,14 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
-    const recording = store.recordings.find(recordingSid);
-    if (recording === null) {
-      return twilioError(reply, 404, 20404, `Recording ${recordingSid} was not found`);
-    }
+    const recording = owned(
+      reply,
+      account,
+      store.recordings.find(recordingSid),
+      'Recording',
+      recordingSid,
+    );
+    if (!recording) return;
     return reply.send(recordingResource(recording, config));
   });
 
@@ -556,13 +713,19 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       const { accountSid, callSid } = request.params as { accountSid: string; callSid: string };
       const account = authenticate(request, reply, accountSid);
       if (!account) return;
+      // The recordings are the call's, so the call is what must be this account's.
+      if (!owned(reply, account, store.calls.find(callSid), 'Call', callSid)) return;
+      const { page, pageSize } = paging(request.query as { PageSize?: string; Page?: string });
       const recordings = store.recordings.list({ callSid });
-      return reply.send({
-        recordings: recordings.map((recording) => recordingResource(recording, config)),
-        page: 0,
-        page_size: recordings.length,
-        uri: `${API}/Accounts/${accountSid}/Calls/${callSid}/Recordings.json`,
-      });
+      return reply.send(
+        pageEnvelope(
+          'recordings',
+          `${API}/Accounts/${account.accountSid}/Calls/${callSid}/Recordings.json`,
+          recordings.map((recording) => recordingResource(recording, config)),
+          page,
+          pageSize,
+        ),
+      );
     },
   );
 
@@ -632,13 +795,17 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     const { accountSid } = request.params as { accountSid: string };
     const account = authenticate(request, reply, accountSid);
     if (!account) return;
+    const { page, pageSize } = paging(request.query as { PageSize?: string; Page?: string });
     const keys = store.apiKeys.list(account.accountSid);
-    return reply.send({
-      keys: keys.map((key) => keyResource(key)),
-      page: 0,
-      page_size: keys.length,
-      uri: `${API}/Accounts/${account.accountSid}/Keys.json`,
-    });
+    return reply.send(
+      pageEnvelope(
+        'keys',
+        `${API}/Accounts/${account.accountSid}/Keys.json`,
+        keys.map((key) => keyResource(key)),
+        page,
+        pageSize,
+      ),
+    );
   });
 
   app.get(`${API}/Accounts/:accountSid/Keys/:keySid.json`, async (request, reply) => {
@@ -672,19 +839,37 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
   });
 
   /**
-   * A key of this account, or a `20404`.
+   * A row of *this* account, or a `20404`.
    *
-   * A key held by *another* account is answered as not found rather than as forbidden:
-   * across an account boundary it does not exist, which is what Twilio says too.
+   * **A resource held by another account is answered as not found rather than as
+   * forbidden**, which is Twilio's answer and also the only one that does not leak: a
+   * `403` would confirm the sid exists, and a sid is the thing an application knows.
+   * Across an account boundary it does not exist.
+   *
+   * Applied to every `:sid` route, not just keys. It used to be keys only, so any
+   * authenticated account could read any other account's calls, recordings and message
+   * bodies by naming the sid — every lookup found the row globally and returned it.
+   *
+   * A parent reaching into a subaccount goes through the child's path, and
+   * `authenticate()` returns the account the *URL* names, so the comparison here is
+   * already against the owning account rather than the credential's.
    */
-  function ownKey(reply: FastifyReply, account: Account, keySid: string): ApiKey | null {
-    const key = store.apiKeys.find(keySid);
-    if (key === null || key.accountSid !== account.accountSid) {
-      twilioError(reply, 404, 20404, `Key ${keySid} was not found`);
+  function owned<T extends { accountSid: string }>(
+    reply: FastifyReply,
+    account: Account,
+    row: T | null,
+    label: string,
+    sid: string,
+  ): T | null {
+    if (row === null || row.accountSid !== account.accountSid) {
+      twilioError(reply, 404, 20404, `${label} ${sid} was not found`);
       return null;
     }
-    return key;
+    return row;
   }
+
+  const ownKey = (reply: FastifyReply, account: Account, keySid: string): ApiKey | null =>
+    owned(reply, account, store.apiKeys.find(keySid), 'Key', keySid);
 
   /* --------------------------------------------------------------- accounts */
 
@@ -726,18 +911,19 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
   app.get(`${API}/Accounts.json`, async (request, reply) => {
     const self = authenticateSelf(request, reply);
     if (!self) return;
-    const query = request.query as { FriendlyName?: string; Status?: string; PageSize?: string };
-    const limit = Number.parseInt(query.PageSize ?? '50', 10) || 50;
+    const query = request.query as {
+      FriendlyName?: string;
+      Status?: string;
+      PageSize?: string;
+      Page?: string;
+    };
+    const { page, pageSize } = paging(query);
     const accounts = [self, ...store.accounts.subaccounts(self.accountSid)]
       .filter((account) => !query.FriendlyName || account.friendlyName === query.FriendlyName)
-      .filter((account) => !query.Status || account.status === query.Status)
-      .slice(0, limit);
-    return reply.send({
-      accounts: accounts.map(accountResource),
-      page: 0,
-      page_size: accounts.length,
-      uri: `${API}/Accounts.json`,
-    });
+      .filter((account) => !query.Status || account.status === query.Status);
+    return reply.send(
+      pageEnvelope('accounts', `${API}/Accounts.json`, accounts.map(accountResource), page, pageSize),
+    );
   });
 
   /**
@@ -882,6 +1068,10 @@ function callResource(call: Call, deps: Deps): Record<string, unknown> {
     group_sid: null,
     queue_time: '0',
     trunk_sid: null,
+    subresource_uris: {
+      recordings: `${API}/Accounts/${call.accountSid}/Calls/${call.sid}/Recordings.json`,
+      events: `${API}/Accounts/${call.accountSid}/Calls/${call.sid}/Events.json`,
+    },
   };
 }
 
@@ -918,7 +1108,7 @@ function messageResource(message: Message): Record<string, unknown> {
     subresource_uris: { media: `${API}/Accounts/${message.accountSid}/Messages/${message.sid}/Media.json` },
     price: null,
     price_unit: null,
-    messaging_service_sid: null,
+    messaging_service_sid: message.messagingServiceSid,
   };
 }
 
@@ -936,13 +1126,34 @@ function numberResource(number: PhoneNumber): Record<string, unknown> {
     status_callback_method: number.statusCallbackMethod,
     sms_url: number.smsUrl,
     sms_method: number.smsMethod,
-    sms_status_callback: number.smsStatusCallbackUrl,
+    // The fields Twilio always sends, as nulls. An application reading
+    // `.voiceFallbackUrl` off the SDK's resource gets `null` rather than `undefined`,
+    // which is the difference between "not configured" and "this field does not exist".
+    // None of them are honoured — there are no fallback webhooks here — and that is in
+    // the README's list of what this is not.
+    voice_fallback_url: null,
+    voice_fallback_method: 'POST',
+    sms_fallback_url: null,
+    sms_fallback_method: 'POST',
+    voice_caller_id_lookup: false,
+    beta: false,
+    status: 'in-use',
+    address_requirements: 'none',
+    address_sid: null,
+    bundle_sid: null,
+    trunk_sid: null,
+    identity_sid: null,
+    emergency_status: 'Inactive',
+    emergency_address_sid: null,
+    voice_receive_mode: 'voice',
     capabilities: { voice: true, sms: true, mms: true, fax: false },
     date_created: rfc2822(number.createdAt),
     date_updated: rfc2822(number.createdAt),
     api_version: '2010-04-01',
     uri: `${API}/Accounts/${number.accountSid}/IncomingPhoneNumbers/${number.sid}.json`,
-    origin: 'localio',
+    // `twilio` rather than `localio`: `origin` is an enum the SDK exposes, and a value
+    // outside it is a resource an application cannot switch on.
+    origin: 'twilio',
   };
 }
 

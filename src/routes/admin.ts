@@ -72,7 +72,6 @@ const numberBody = z.object({
   status_callback_method: method,
   sms_url: urlOrNull,
   sms_method: method,
-  sms_status_callback_url: urlOrNull,
 });
 
 const numberPatch = numberBody.partial().omit({ phone_number: true });
@@ -137,7 +136,6 @@ export function numberView(number: PhoneNumber): Record<string, unknown> {
     status_callback_method: number.statusCallbackMethod,
     sms_url: number.smsUrl,
     sms_method: number.smsMethod,
-    sms_status_callback_url: number.smsStatusCallbackUrl,
     created_at: number.createdAt,
   };
 }
@@ -310,7 +308,6 @@ export function registerAdmin(app: FastifyInstance, store: Store): void {
       statusCallbackMethod: body.status_callback_method,
       smsUrl: body.sms_url,
       smsMethod: body.sms_method,
-      smsStatusCallbackUrl: body.sms_status_callback_url,
     });
     return reply.code(201).send(numberView(number));
   });
@@ -339,7 +336,6 @@ export function registerAdmin(app: FastifyInstance, store: Store): void {
       statusCallbackMethod: body.status_callback_method,
       smsUrl: body.sms_url,
       smsMethod: body.sms_method,
-      smsStatusCallbackUrl: body.sms_status_callback_url,
     });
     if (number === null) return reply.code(404).send({ error: 'not_found' });
     return numberView(number);
@@ -481,7 +477,6 @@ export function applySeed(store: Store, seed: Seed): { accounts: number; numbers
       statusCallbackMethod: entry.status_callback_method,
       smsUrl: entry.sms_url,
       smsMethod: entry.sms_method,
-      smsStatusCallbackUrl: entry.sms_status_callback_url,
     });
     numbers += 1;
   }

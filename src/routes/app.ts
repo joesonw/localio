@@ -4,7 +4,10 @@ import type { CallClaims } from '../call-claims.js';
 import type { CallFeed, CallFeedKind } from '../call-feed.js';
 import type { Config } from '../config.js';
 import type { Call, Message, Recording, Store } from '../db/index.js';
+import type { Logger } from 'pino';
+import { postCallStatus } from '../call-status.js';
 import type { SmsService } from '../sms.js';
+import type { WebhookPoster } from '../webhook.js';
 
 /**
  * What the UI reads and drives.
@@ -29,19 +32,28 @@ const sendBody = z.object({
   from: z.string().min(1).max(64),
   to: z.string().min(1).max(64),
   body: z.string().max(1600),
+  /**
+   * The same `StatusCallback` a `POST …/Messages.json` takes, for parity — a message
+   * injected from the page can ask to be told how it went too. The Phone panel does not
+   * draw a field for it; this is for anything driving `/api` directly.
+   */
+  status_callback_url: z.string().url().max(2048).optional(),
 });
 
 interface Deps {
   store: Store;
   sms: SmsService;
   config: Config;
+  logger: Logger;
+  /** So declining a queued call can report `canceled` the way Twilio does. */
+  poster: WebhookPoster;
   liveCallSids: () => Set<string>;
   claims: CallClaims;
   feed: CallFeed;
 }
 
 export function registerApp(app: FastifyInstance, deps: Deps): void {
-  const { store, sms, config, claims, feed } = deps;
+  const { store, sms, config, claims, feed, poster, logger } = deps;
 
   /**
    * Say a pending call moved, **after** it already has.
@@ -105,10 +117,15 @@ export function registerApp(app: FastifyInstance, deps: Deps): void {
   /**
    * Decline a ringing call.
    *
-   * **No webhook is posted at all**, which is the point: a call nobody picked up never
-   * reached the application, so telling it one did would be inventing a call. The row
-   * stays, as `canceled`, because a placement that was declined is worth still being able
-   * to see.
+   * The row stays, as `canceled`, because a placement that was declined is worth still
+   * being able to see — and **the status callback is posted**, carrying `canceled`.
+   * Twilio reports a call that ended without being answered, and an application that
+   * placed one has no other way to learn it will never be answered: nothing arriving is
+   * indistinguishable from a call still ringing.
+   *
+   * Posted *after* `cancel()` returned true, so the frame can never describe a decline
+   * that declined nothing — the conditional UPDATE is what decided it, exactly as with
+   * the feed below.
    */
   app.delete('/api/calls/:sid', async (request, reply) => {
     const { sid } = request.params as { sid: string };
@@ -117,6 +134,20 @@ export function registerApp(app: FastifyInstance, deps: Deps): void {
         error: 'not_queued',
         message: 'that call is not waiting to be answered — it may already have been taken',
       });
+    }
+    const declined = store.calls.find(sid);
+    const account = declined ? store.accounts.find(declined.accountSid) : null;
+    if (declined !== null && account !== null) {
+      await postCallStatus(
+        { store, poster, logger },
+        {
+          call: declined,
+          event: 'completed',
+          status: 'canceled',
+          authToken: account.authToken,
+          fallbackUrl: store.numbers.findByNumber(declined.from)?.statusCallbackUrl ?? null,
+        },
+      );
     }
     // Unconditional: the call is gone, so whoever was mid-pickup has nothing left to hold.
     claims.release(sid);
@@ -212,7 +243,8 @@ export function registerApp(app: FastifyInstance, deps: Deps): void {
         message: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
       });
     }
-    const result = await sms.send({ ...parsed.data, direction: 'inbound' });
+    const { status_callback_url: statusCallbackUrl, ...fields } = parsed.data;
+    const result = await sms.send({ ...fields, direction: 'inbound', statusCallbackUrl });
     return {
       message: messageView(result.message),
       webhook: result.webhook,
@@ -395,6 +427,7 @@ function messageView(message: Message): Record<string, unknown> {
     status: message.status,
     num_segments: message.numSegments,
     error_code: message.errorCode,
+    status_callback_url: message.statusCallbackUrl,
     created_at: message.createdAt,
   };
 }

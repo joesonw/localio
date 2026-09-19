@@ -1,6 +1,6 @@
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
-import type { Message, Store } from './db/index.js';
+import type { Message, MessageStatus, Store } from './db/index.js';
 import { parseTwiml } from './twiml/parse.js';
 import { attr } from './twiml/parse.js';
 import { messageForm, messageStatusForm, type WebhookPoster } from './webhook.js';
@@ -76,6 +76,12 @@ export class SmsService {
     accountSid?: string;
     direction?: 'inbound' | 'outbound-api' | 'outbound-reply';
     depth?: number;
+    /**
+     * Where to report this message's delivery status, from the sender's own
+     * `StatusCallback`. **Not inherited by a reply** — see {@link deliverReply}.
+     */
+    statusCallbackUrl?: string | null;
+    messagingServiceSid?: string | null;
   }): Promise<DeliveryResult> {
     const destination = this.store.numbers.findByNumber(input.to);
     const origin = this.store.numbers.findByNumber(input.from);
@@ -90,14 +96,15 @@ export class SmsService {
       to: input.to,
       body: input.body,
       direction: input.direction ?? (origin ? 'outbound-api' : 'inbound'),
+      statusCallbackUrl: input.statusCallbackUrl ?? null,
+      messagingServiceSid: input.messagingServiceSid ?? null,
     });
 
     if (destination === null) {
       // Stored and left. A real Twilio would try to deliver to a carrier; there is no
       // carrier here, and claiming `delivered` would be inventing an outcome.
-      this.store.messages.setStatus(message.sid, 'sent');
       return {
-        message: { ...message, status: 'sent' },
+        message: await this.settle(message, 'sent'),
         webhook: null,
         reply: null,
         note: `${input.to} is not a number this simulator holds, so nothing was notified`,
@@ -105,9 +112,8 @@ export class SmsService {
     }
 
     if (!destination.smsUrl) {
-      this.store.messages.setStatus(message.sid, 'delivered');
       return {
-        message: { ...message, status: 'delivered' },
+        message: await this.settle(message, 'delivered'),
         webhook: null,
         reply: null,
         note: `${destination.phoneNumber} has no sms_url, so the message was stored but nothing was called`,
@@ -116,9 +122,8 @@ export class SmsService {
 
     const account = this.store.accounts.find(destination.accountSid);
     if (account === null) {
-      this.store.messages.setStatus(message.sid, 'failed', 30001);
       return {
-        message: { ...message, status: 'failed' },
+        message: await this.settle(message, 'failed', 30001),
         webhook: null,
         reply: null,
         note: 'the account holding the destination number no longer exists',
@@ -141,21 +146,14 @@ export class SmsService {
     );
 
     const ok = result.status >= 200 && result.status < 300;
-    this.store.messages.setStatus(message.sid, ok ? 'delivered' : 'failed', ok ? null : 30003);
-    void this.reportStatus(destination.smsStatusCallbackUrl, account.authToken, {
-      messageSid: message.sid,
-      accountSid: account.accountSid,
-      from: message.from,
-      to: message.to,
-      status: ok ? 'delivered' : 'failed',
-    });
+    const settled = await this.settle(message, ok ? 'delivered' : 'failed', ok ? null : 30003);
 
     const reply = ok
       ? await this.deliverReply(result.body, destination.phoneNumber, message.from, account.accountSid, input.depth ?? 0)
       : null;
 
     return {
-      message: { ...message, status: ok ? 'delivered' : 'failed' },
+      message: settled,
       webhook: { status: result.status, body: result.body, url: result.url },
       reply,
     };
@@ -214,15 +212,60 @@ export class SmsService {
     return last;
   }
 
-  private async reportStatus(
-    url: string | null,
-    authToken: string,
-    facts: Parameters<typeof messageStatusForm>[0],
-  ): Promise<void> {
-    if (!url) return;
-    await this.poster.post(url, authToken, messageStatusForm(facts), 'POST', {
-      kind: 'message-status',
-      messageSid: facts.messageSid,
-    });
+  /**
+   * Write a message's final status, and tell whoever asked to be told.
+   *
+   * **Every status this class writes goes through here**, which is the only reason the
+   * four ways a message can end are all reported. They were not: three of them returned
+   * before the single call site that posted anything, so a message to a number this
+   * simulator does not hold simply went quiet — the one outcome a simulator exists to
+   * make legible.
+   *
+   * The callback is the **sender's**, named on that message, and it is signed with the
+   * **sender's** auth token. Both halves matter and neither used to be true: it was read
+   * off the destination number's row and signed with the destination account's token, so
+   * an application validating the signature the way Twilio's SDK does rejected it with
+   * nothing naming why.
+   *
+   * Awaited rather than fired and forgotten. A status callback is part of what sending a
+   * message did, and `send()` is already the slow path its callers await.
+   */
+  private async settle(
+    message: Message,
+    status: MessageStatus,
+    errorCode: number | null = null,
+  ): Promise<Message> {
+    const stored = this.store.messages.setStatus(message.sid, status, errorCode);
+    const settled: Message = stored ?? { ...message, status, errorCode };
+    const url = settled.statusCallbackUrl;
+    if (!url) return settled;
+
+    // The sender's account, not the destination's. For a REST send that is the
+    // authenticated account; for a message injected from an outside number it is the one
+    // resolved in `send()`, which is the account whose webhook this describes either way.
+    const account = this.store.accounts.find(settled.accountSid);
+    if (account === null) {
+      this.logger.warn(
+        { messageSid: settled.sid, accountSid: settled.accountSid },
+        'no account to sign a message status callback with, so none was posted',
+      );
+      return settled;
+    }
+
+    await this.poster.post(
+      url,
+      account.authToken,
+      messageStatusForm({
+        messageSid: settled.sid,
+        accountSid: settled.accountSid,
+        from: settled.from,
+        to: settled.to,
+        status,
+        errorCode,
+      }),
+      'POST',
+      { kind: 'message-status', messageSid: settled.sid },
+    );
+    return settled;
   }
 }

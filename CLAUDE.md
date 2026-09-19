@@ -58,8 +58,8 @@ TwiML executor, which reaches the outside world only through a host interface.
 - **`src/db/`** — six stores over one `better-sqlite3` connection, exposed as `Store`.
   Routes take `Store`, never a raw `Db`; a route writing its own SQL is how a second sid
   mint site appears. Migrations are an append-only `STEPS` ladder in `open.ts` keyed on
-  `PRAGMA user_version` — **never edit a released step**; step 2 is `002-api-keys.sql` and
-  step 3 `003-subaccounts.sql`.
+  `PRAGMA user_version` — **never edit a released step**; step 2 is `002-api-keys.sql`,
+  step 3 `003-subaccounts.sql` and step 4 `004-twilio-fidelity.sql`.
   The `.sql` files are read relative to the module, which is why the build copies them
   into `dist/db/`.
 - **`src/routes/`** — three families plus static: `/2010-04-01` (Twilio REST, HTTP Basic
@@ -134,8 +134,22 @@ behaviour somewhere far away.
 - **Marks are echoed after playback, not on receipt.** The browser sends the mark back from
   `onended`; the server only forwards. Echoing on arrival over-reports by the whole client
   buffer.
-- **Teardown is one idempotent path**, and the status callback is posted from it, only for
-  a call that actually connected.
+- **Teardown is one idempotent path**, and the `completed` status callback is posted from
+  it for **every** call that ended — `completed`, `busy`, `no-answer`, `failed` — because
+  that is what Twilio does and `CallStatus` already says which. It used to be withheld
+  from a call that never reached a document; an application waiting on it to release a
+  seat then waited forever. Declining a queued call posts `canceled` from
+  `routes/app.ts`. All five posting sites go through `call-status.ts`, which owns the
+  `StatusCallbackEvent` filter (unnamed means `completed` alone) and the per-call
+  `SequenceNumber` — the counter lives on the row because `initiated` is posted from the
+  REST route before any session exists.
+- **A sid is not a capability.** Every `/2010-04-01` `:sid` route runs its row through
+  `owned()`, which answers `20404` across an account boundary. A global `find()` handed
+  straight back is how one account reads another's message bodies.
+- **Message status callbacks are per message and the sender's.** `StatusCallback` on
+  `POST Messages.json` lands on the message row; `SmsService.settle()` is the only place a
+  message status is written, so every outcome reports, and it signs with the **sender's**
+  token. There is no SMS status callback on a number — migration 4 dropped that column.
 - **REST response shape.** snake_case, RFC 2822 timestamps, `duration` as a string,
   unknowable fields (`price`, `answered_by`, `caller_name`) as `null`, unknown sids as
   Twilio's `20404` envelope, unimplemented paths as `501` naming the path. Each of these

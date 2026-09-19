@@ -234,16 +234,32 @@ export function voiceForm(facts: CallFacts, status = 'ringing'): Record<string, 
  * real provider posts it.
  */
 export function statusForm(
-  facts: CallFacts & { durationSeconds: number; status: string },
+  facts: CallFacts & {
+    durationSeconds: number;
+    status: string;
+    /** 0-based and monotonic per call. Twilio's own ordering hint for out-of-order arrivals. */
+    sequenceNumber?: number;
+    timestamp?: Date;
+  },
 ): Record<string, string> {
   return {
     CallSid: facts.callSid,
     AccountSid: facts.accountSid,
     From: facts.from,
     To: facts.to,
+    // Twilio sends both spellings on a status callback as well as on the voice webhook,
+    // and an application that resolved its number off `Called` on one will do it on the
+    // other. Leaving them out sends a different signed body from the real one.
+    Caller: facts.from,
+    Called: facts.to,
     Direction: facts.direction,
     CallStatus: facts.status,
     CallDuration: String(facts.durationSeconds),
+    // `call-progress-events` is the only source this app has. Twilio's other value is for
+    // callbacks it makes on your behalf from a `<Dial>`, which is not implemented.
+    CallbackSource: 'call-progress-events',
+    SequenceNumber: String(facts.sequenceNumber ?? 0),
+    Timestamp: (facts.timestamp ?? new Date()).toUTCString(),
     ApiVersion: API_VERSION,
   };
 }
@@ -259,7 +275,8 @@ export function statusForm(
  * `MessageSid`, `SmsSid` and `SmsMessageSid` are the same value three times. Twilio sends
  * all three for compatibility with its own older messaging API, and every one of them is
  * signed — so leaving two out would not merely send less, it would send a different body
- * from the one a real webhook has.
+ * from the one a real webhook has. `SmsStatus` is `received` for the same reason: it is
+ * constant on an inbound webhook, and applications still branch on it.
  */
 export function messageForm(facts: {
   messageSid: string;
@@ -279,6 +296,7 @@ export function messageForm(facts: {
     Body: facts.body,
     NumMedia: '0',
     NumSegments: String(facts.numSegments ?? 1),
+    SmsStatus: 'received',
     ApiVersion: API_VERSION,
   };
 }
@@ -308,15 +326,24 @@ export function recordingForm(
   return form;
 }
 
-/** A message's delivery status, posted to a number's `sms_status_callback_url`. */
+/**
+ * A message's delivery status, posted to the `StatusCallback` **the sender named on that
+ * message** — never to a setting on a number.
+ *
+ * `SmsStatus` and `MessageStatus` carry the same value: the first is the older spelling,
+ * still sent, and applications written against either one read the same transition.
+ * `ErrorCode` appears only on a status that has one, which is how Twilio sends it — an
+ * `ErrorCode=` on a `delivered` would have applications branching on an empty string.
+ */
 export function messageStatusForm(facts: {
   messageSid: string;
   accountSid: string;
   from: string;
   to: string;
   status: string;
+  errorCode?: number | null;
 }): Record<string, string> {
-  return {
+  const form: Record<string, string> = {
     MessageSid: facts.messageSid,
     SmsSid: facts.messageSid,
     SmsStatus: facts.status,
@@ -326,4 +353,8 @@ export function messageStatusForm(facts: {
     To: facts.to,
     ApiVersion: API_VERSION,
   };
+  if (facts.errorCode !== undefined && facts.errorCode !== null) {
+    form.ErrorCode = String(facts.errorCode);
+  }
+  return form;
 }

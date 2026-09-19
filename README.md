@@ -95,6 +95,14 @@ on `main` (`:main`), for `linux/amd64` and `linux/arm64`.
 | **Phone** | one of your numbers, as a handset. Calls waiting to be picked up sit across the top; pick a number under them and everything below is its own: its calls on the left, the keypad in the middle, its conversations on the right. |
 | **Admin** | accounts, API keys and phone numbers. Create an account to get a sid and token, name a parent to make it a subaccount, mint a key if the application under test is built with one, add numbers and edit their webhook URLs in place. Subaccounts sit indented under their parent, with a status you can suspend from here. This is the only configuration there is. |
 
+![The Phone panel — picker, calls, keypad and conversations](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview1.jpg)
+
+*The Phone panel: one number, its calls, its keypad, its conversations.*
+
+![The Admin panel — accounts, API keys and phone numbers](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview2.jpg)
+
+*The Admin panel: accounts and subaccounts, API keys, and numbers with their webhook URLs.*
+
 ### The Phone panel
 
 The picker near the top is the whole page's subject — think of it as which SIM is in the
@@ -143,10 +151,10 @@ there before that tab has finished asking for its microphone.
 | `<Pause>` | waits. |
 | `<Record>` | records the caller and writes `data/recordings/RE….wav`. Honours `maxLength`, `timeout`, `finishOnKey`, `playBeep`, `trim`, `recordingStatusCallback` and `action`. |
 | `<Redirect>` | fetches the next document and continues in it. |
-| `<Reject>` | ends the call as `busy` or `no-answer`, and posts **no** status callback — nothing ever connected. |
+| `<Reject>` | ends the call as `busy` or `no-answer`, and **posts the status callback** carrying that status, as Twilio does. |
 | `<Hangup>` | ends the call and posts the status callback. |
 | `<Connect><Stream>` | opens the Media Streams socket, relays the `<Parameter>` children verbatim into the `start` frame, and bridges the browser's PCM16 to µ-law. |
-| `<Message>` | sends an SMS. In a messaging webhook's answer, this is the reply. |
+| `<Message>` | sends an SMS, delivered the same way `POST Messages.json` delivers one. In a messaging webhook's answer, this is the reply. |
 | anything else | logged as unsupported and **skipped**. `<Gather>` and `<Dial>` take this path. |
 
 ## `<Record>`
@@ -185,6 +193,18 @@ left. Nobody is on the other end, which is what that means.
 A reply chain stops after five hops, because two auto-replying numbers pointed at each
 other is the first thing anybody tries.
 
+**Delivery status is reported per message, to the sender.** Name a `StatusCallback` on
+`POST …/Messages.json` and localio posts that message's final status to it, signed with
+your account's auth token — `MessageSid`, `MessageStatus` and `SmsStatus`, plus `ErrorCode`
+when there is one. This is Twilio's shape: there is no SMS status callback on a number.
+An `IncomingPhoneNumber` has `sms_url` for inbound messages and `status_callback` for
+voice, and nothing at all for delivery status.
+
+Every outcome is reported, which is the point — a message to a number localio does not hold
+comes back `sent`, one to a held number with no `sms_url` comes back `delivered`, and a
+webhook that refuses comes back `failed` with `ErrorCode=30003`. A `<Message>` reply is its
+own message and does not inherit the callback of the message that prompted it.
+
 ## The routes
 
 ### `/2010-04-01` — the Twilio REST API
@@ -206,16 +226,21 @@ is not `active` is refused with a `20005`.
 Paths below are relative to `/2010-04-01/Accounts/:sid`, except the two `Accounts` routes
 at the top, which are absolute.
 
+**A sid names a resource of the account in the path, or nothing.** Every `:sid` route
+answers `20404` for a row another account holds — not `403`, which would confirm it
+exists. Lists carry Twilio's full envelope (`first_page_uri`, `next_page_uri`, `start`,
+`end`), so the SDK's auto-pagination walks every page rather than stopping after one.
+
 | | |
 | --- | --- |
 | `POST GET /2010-04-01/Accounts.json` | create a **subaccount**, and list yourself plus your subaccounts. `FriendlyName` and `Status` narrow the list. A subaccount cannot hold subaccounts — one level, as at Twilio. |
 | `GET POST /2010-04-01/Accounts/:sid.json` | fetch, rename, or change a subaccount's `Status` (a `POST`, because that is what the SDK sends). `Status` is refused on a top-level account: suspending the credential that reaches this route would shut the API out of itself. These two are reachable on a suspended subaccount, so its parent can start it again. |
-| `POST Calls.json` | places a call — it **registers**, appears on the Phone panel and waits to be answered. `queued` is the honest status. The `Url` you name is where it will be answered, so your own routing on that query string survives. |
-| `GET Calls.json` | lists this account's calls. `PageSize` and `Status` narrow it. |
+| `POST Calls.json` | places a call — it **registers**, appears on the Phone panel and waits to be answered. `queued` is the honest status. The `Url` you name is where it will be answered, so your own routing on that query string survives. `Twiml` may stand in for `Url`. `Method`, `StatusCallback`, `StatusCallbackMethod` and `StatusCallbackEvent` are all honoured. |
+| `GET Calls.json` | lists this account's calls. `PageSize`, `Page` and `Status` narrow it. |
 | `GET Calls/:sid.json` | one call. Reports `in-progress` while the sid is live. |
-| `POST Calls/:sid.json` | accepted and logged, but it does **not** redirect a live call. The SDK's `.update()` lands here and should not fail. |
-| `POST Messages.json` | sends, and actually delivers to the destination's `sms_url`. |
-| `GET Messages.json` | lists messages. `To` and `From` narrow it. |
+| `POST Calls/:sid.json` | `Status=completed` ends a live call and `canceled` drops a queued one, through the same teardown as any other hang-up. `Url` and `Twiml` are logged but do **not** redirect a live call. |
+| `POST Messages.json` | sends, and actually delivers to the destination's `sms_url`. `StatusCallback` is honoured per message, signed with the sending account's token. |
+| `GET Messages.json` | lists messages. `To`, `From`, `PageSize` and `Page` narrow it. |
 | `GET Messages/:sid.json` | one message. |
 | `GET POST Keys.json` | list and mint API keys. The create is the only answer that carries the `secret` — a read never does, exactly as at Twilio. |
 | `GET POST DELETE Keys/:sid.json` | fetch, rename (a `POST`, because that is what the SDK sends) and delete. A key of another account is a `20404`: across that boundary it does not exist. |
@@ -339,7 +364,11 @@ path nothing above matched.
    few seconds, because the tab that claimed and then died is not coming back to release it.
 4. The voice webhook goes to the `Url` the placement named, verbatim, with
    `Direction: outbound-api`.
-5. The status callback goes to the `StatusCallback` the placement named, verbatim.
+5. The status callback goes to the `StatusCallback` the placement named, verbatim —
+   filtered by `StatusCallbackEvent`, which defaults to `completed` alone as at Twilio.
+   localio can report `initiated` (the placement registered), `ringing` (a tab took the
+   queued row), `answered` (the document parsed) and `completed` (teardown). Each carries
+   `SequenceNumber`, one monotonic sequence per call.
 
 **Decline** drops the call and posts no webhook at all, because a call nobody picked up
 never reached your application.
@@ -394,44 +423,22 @@ seedable; the seed file pins accounts and numbers only. A seeded account may nam
 - **Not a carrier.** A message to a number it does not hold is stored, not delivered. A
   provisioned number is one *it* holds, not one anybody can dial.
 - **Not complete TwiML.** `<Gather>` and `<Dial>` are not implemented; they are logged and
-  skipped, and the executor is shaped so they drop in.
+  skipped, and the executor is shaped so they drop in. `<Say loop="0">` plays once rather
+  than until the call ends, and `<Play digits=…>` is logged rather than synthesised.
 - **Not a speech engine.** `<Say>` shows text. There is no TTS and no transcription.
 - **Not an MP3 encoder.** Recordings are WAV; `<Play>` reads WAV.
-
-## Tests
-
-```bash
-npm test
-```
-
-Hermetic — no socket, no network, no fixtures on disk beyond a temp directory. The ones
-worth knowing about:
-
-- **`signature.test.ts`** asserts that `twilio.validateRequest` — the real SDK's verifier,
-  the function your application actually calls — accepts what localio signs. *The most
-  important test here*, because its failure has no symptom but a blanket 403 with nothing
-  anywhere naming the character that differed. `twilio` is a devDependency for this and
-  must not become a runtime one: localio is an independent implementation of that wire on
-  purpose.
-- **`twilio-api.test.ts`** covers the things that are silent when wrong — a form body that
-  is not read at all (415, which reads as an outage), snake_case, RFC 2822, `duration` as a
-  string, the `501` catch-all, the `20404` shape, and that fetching a queued call does not
-  consume it.
-- **`g711.test.ts`** covers the µ-law round trip, the sign, and full-scale clipping at
-  `32635` — get that wrong and it does not throw, it just sounds like a blown speaker.
-- **`execute.test.ts`** covers verb ordering, which verbs are terminal, an unknown verb
-  being skipped rather than fatal, and `<Record action>` continuing in the document it
-  fetched.
-- **`recorder.test.ts`** covers the four ways a recording stops and how each is reported.
-
-## Where this came from
-
-Extracted from a provider stand-in inside another monorepo, which read its phone numbers
-out of that deployment's Postgres, opened sealed credentials with its encryption key, and
-supported three TwiML verbs. The reusable half — webhook signing, the REST API shape, the
-Media Streams envelope, the µ-law codec, the handset — is here; the rest is now SQLite and
-an admin API, and the TwiML reader became an executor.
-
+- **Not a retrying webhook client.** One attempt, no fallback URL. A `voice_fallback_url`
+  is accepted onto the resource and never called, because the failure this exists to show
+  you is the first one, not the second.
+- **Not a call router.** `POST Calls/:sid.json` will end a call but not redirect one:
+  changing the document under a live call means abandoning whatever verb is mid-flight,
+  and the executor has no cancellation to hang that on.
+- **No answering machine detection.** `AnsweredBy` is always `null` and `MachineDetection`
+  is ignored. Nor is there a ring timeout: `Timeout` is ignored and a queued call waits
+  until a tab takes it or somebody declines it.
+- **No Messaging Services.** A `MessagingServiceSid` is stored and echoed back, not
+  resolved to a sender pool.
+- 
 ## License
 
 MIT — see [LICENSE](LICENSE).
