@@ -18,6 +18,7 @@ const STEPS: Array<{ name: string; sql: string }> = [
   { name: '002-api-keys', sql: readSchema('002-api-keys.sql') },
   { name: '003-subaccounts', sql: readSchema('003-subaccounts.sql') },
   { name: '004-twilio-fidelity', sql: readSchema('004-twilio-fidelity.sql') },
+  { name: '005-messaging-services', sql: readSchema('005-messaging-services.sql') },
 ];
 
 function readSchema(file: string): string {

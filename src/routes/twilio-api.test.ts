@@ -1227,3 +1227,344 @@ test('the media subresource a message advertises is a real route', async () => {
   assert.deepEqual(media.json().media_list, []);
   await server.close();
 });
+
+/* ------------------------------------------------- messaging services (/v1) */
+
+const MESSAGING = '/v1';
+
+/** A service with two numbers in it, and a form-post helper for the routes under test. */
+async function pooled(): Promise<{
+  server: LocalioServer;
+  store: Store;
+  accountSid: string;
+  auth: string;
+  serviceSid: string;
+  pool: string[];
+}> {
+  const base = await fixture();
+  const service = base.store.messagingServices.create({
+    accountSid: base.accountSid,
+    friendlyName: 'support',
+  });
+  const pool: string[] = [];
+  for (const phoneNumber of ['+15550000002', '+15550000003']) {
+    const number = base.store.numbers.create({
+      phoneNumber,
+      accountSid: base.accountSid,
+    });
+    base.store.messagingServices.addNumber(service.sid, number.sid);
+    pool.push(phoneNumber);
+  }
+  return { ...base, serviceSid: service.sid, pool };
+}
+
+const form = { 'content-type': 'application/x-www-form-urlencoded' };
+
+/**
+ * **A Messaging Service resolves a sender; it never becomes one.** The regression is
+ * silent: an `MG…` in `from_number` is read as a phone number by `findByNumber`, `usage()`
+ * and every thread view, all of which find nothing and raise nothing.
+ */
+test('a send naming only a MessagingServiceSid goes out from a number in the pool', async () => {
+  const { server, accountSid, auth, serviceSid, pool } = await pooled();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Messages.json`,
+    headers: { authorization: auth, ...form },
+    payload: `To=%2B15559999999&Body=hi&MessagingServiceSid=${serviceSid}`,
+  });
+  assert.equal(response.statusCode, 201);
+  assert.ok(pool.includes(response.json().from), `${response.json().from} is in the pool`);
+  assert.equal(response.json().messaging_service_sid, serviceSid);
+  await server.close();
+});
+
+test('an empty pool has no sender to invent', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const service = store.messagingServices.create({ accountSid, friendlyName: 'empty' });
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Messages.json`,
+    headers: { authorization: auth, ...form },
+    payload: `To=%2B15559999999&Body=hi&MessagingServiceSid=${service.sid}`,
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, 21703);
+  await server.close();
+});
+
+test('From wins over a MessagingServiceSid, and the sid is still echoed', async () => {
+  const { server, accountSid, auth, serviceSid } = await pooled();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Messages.json`,
+    headers: { authorization: auth, ...form },
+    payload: `To=%2B15559999999&Body=hi&From=%2B15550000001&MessagingServiceSid=${serviceSid}`,
+  });
+  assert.equal(response.json().from, '+15550000001');
+  assert.equal(response.json().messaging_service_sid, serviceSid);
+  await server.close();
+});
+
+test('a MessagingServiceSid of another account is a 20404, sid in the body or not', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const stranger = store.accounts.create({ friendlyName: 'stranger' });
+  const theirs = store.messagingServices.create({
+    accountSid: stranger.accountSid,
+    friendlyName: 'theirs',
+  });
+  for (const sid of [theirs.sid, `MG${'0'.repeat(32)}`]) {
+    const response = await server.app.inject({
+      method: 'POST',
+      url: `${API}/Accounts/${accountSid}/Messages.json`,
+      headers: { authorization: auth, ...form },
+      payload: `To=%2B15559999999&Body=hi&MessagingServiceSid=${sid}`,
+    });
+    assert.equal(response.statusCode, 404, sid);
+    assert.equal(response.json().code, 20404, sid);
+  }
+  await server.close();
+});
+
+test("the service's status callback is the fallback for a send that named none", async () => {
+  const { server, store, accountSid, auth, serviceSid } = await pooled();
+  store.messagingServices.update(serviceSid, {
+    statusCallbackUrl: 'http://app.test/pool-status',
+  });
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${API}/Accounts/${accountSid}/Messages.json`,
+    headers: { authorization: auth, ...form },
+    payload: `To=%2B15559999999&Body=hi&MessagingServiceSid=${serviceSid}`,
+  });
+  const stored = store.messages.find(response.json().sid);
+  assert.equal(stored?.statusCallbackUrl, 'http://app.test/pool-status');
+  await server.close();
+});
+
+/**
+ * The `/v1` family has **no account sid in the path**, so the credential is the account.
+ * Every route below proves that by naming one nowhere.
+ */
+test('a service round-trips over /v1 with no account sid in the path', async () => {
+  const { server, auth } = await fixture();
+  const created = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services`,
+    headers: { authorization: auth, ...form },
+    payload: 'FriendlyName=support&InboundRequestUrl=http%3A%2F%2Fapp.test%2Fpool',
+  });
+  assert.equal(created.statusCode, 201);
+  const sid = created.json().sid;
+  assert.match(sid, /^MG[0-9a-f]{32}$/);
+  assert.equal(created.json().inbound_request_url, 'http://app.test/pool');
+  // ISO 8601, which is what the v1 deserializer parses — RFC 2822 is `/2010-04-01`'s.
+  assert.match(created.json().date_created, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(created.json().links, { phone_numbers: `/v1/Services/${sid}/PhoneNumbers` });
+
+  const listed = await server.app.inject({
+    url: `${MESSAGING}/Services`,
+    headers: { authorization: auth },
+  });
+  assert.equal(listed.json().services.length, 1);
+  assert.equal(listed.json().meta.key, 'services');
+
+  const renamed = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services/${sid}`,
+    headers: { authorization: auth, ...form },
+    payload: 'FriendlyName=renamed&InboundRequestUrl=',
+  });
+  assert.equal(renamed.json().friendly_name, 'renamed');
+  // An empty box clears the URL; a field left out keeps what it had.
+  assert.equal(renamed.json().inbound_request_url, null);
+
+  const deleted = await server.app.inject({
+    method: 'DELETE',
+    url: `${MESSAGING}/Services/${sid}`,
+    headers: { authorization: auth },
+  });
+  assert.equal(deleted.statusCode, 204);
+  const gone = await server.app.inject({
+    url: `${MESSAGING}/Services/${sid}`,
+    headers: { authorization: auth },
+  });
+  assert.equal(gone.json().code, 20404);
+  await server.close();
+});
+
+test('a FriendlyName is required to create a service', async () => {
+  const { server, auth } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services`,
+    headers: { authorization: auth, ...form },
+    payload: 'InboundRequestUrl=http%3A%2F%2Fapp.test%2Fpool',
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, 20001);
+  await server.close();
+});
+
+test("another account's service does not exist over /v1", async () => {
+  const { server, store, serviceSid } = await pooled();
+  const stranger = store.accounts.create({ friendlyName: 'stranger' });
+  const theirAuth = `Basic ${Buffer.from(
+    `${stranger.accountSid}:${stranger.authToken}`,
+  ).toString('base64')}`;
+  const response = await server.app.inject({
+    url: `${MESSAGING}/Services/${serviceSid}`,
+    headers: { authorization: theirAuth },
+  });
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json().code, 20404);
+  // And the list is the stranger's own, which is empty.
+  const listed = await server.app.inject({
+    url: `${MESSAGING}/Services`,
+    headers: { authorization: theirAuth },
+  });
+  assert.deepEqual(listed.json().services, []);
+  await server.close();
+});
+
+/** A key authenticates the whole API, and `/v1` is part of it. */
+test('an SK key opens /v1 too', async () => {
+  const { server, store, accountSid } = await fixture();
+  const key = store.apiKeys.create({ accountSid, friendlyName: 'ci' });
+  const response = await server.app.inject({
+    url: `${MESSAGING}/Services`,
+    headers: {
+      authorization: `Basic ${Buffer.from(`${key.sid}:${key.secret}`).toString('base64')}`,
+    },
+  });
+  assert.equal(response.statusCode, 200);
+  await server.close();
+});
+
+test('the pool is attached, listed and detached over /v1', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  const created = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services`,
+    headers: { authorization: auth, ...form },
+    payload: 'FriendlyName=support',
+  });
+  const sid = created.json().sid;
+  const number = store.numbers.findByNumber('+15550000001');
+  assert.ok(number);
+
+  const added = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services/${sid}/PhoneNumbers`,
+    headers: { authorization: auth, ...form },
+    payload: `PhoneNumberSid=${number.sid}`,
+  });
+  assert.equal(added.statusCode, 201);
+  assert.equal(added.json().sid, number.sid);
+  assert.equal(added.json().service_sid, sid);
+
+  // Adding it again asked for a state that is already true.
+  const again = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services/${sid}/PhoneNumbers`,
+    headers: { authorization: auth, ...form },
+    payload: `PhoneNumberSid=${number.sid}`,
+  });
+  assert.equal(again.statusCode, 201);
+  assert.equal(store.messagingServices.numberCount(sid), 1);
+
+  const listed = await server.app.inject({
+    url: `${MESSAGING}/Services/${sid}/PhoneNumbers`,
+    headers: { authorization: auth },
+  });
+  assert.equal(listed.json().phone_numbers.length, 1);
+
+  const removed = await server.app.inject({
+    method: 'DELETE',
+    url: `${MESSAGING}/Services/${sid}/PhoneNumbers/${number.sid}`,
+    headers: { authorization: auth },
+  });
+  assert.equal(removed.statusCode, 204);
+  const missing = await server.app.inject({
+    method: 'DELETE',
+    url: `${MESSAGING}/Services/${sid}/PhoneNumbers/${number.sid}`,
+    headers: { authorization: auth },
+  });
+  assert.equal(missing.json().code, 20404);
+  await server.close();
+});
+
+test('a number already in another service is refused, naming the one in the way', async () => {
+  const { server, store, accountSid, auth, serviceSid } = await pooled();
+  const other = store.messagingServices.create({ accountSid, friendlyName: 'billing' });
+  const [member] = store.messagingServices.numbers(serviceSid);
+  assert.ok(member);
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services/${other.sid}/PhoneNumbers`,
+    headers: { authorization: auth, ...form },
+    payload: `PhoneNumberSid=${member.sid}`,
+  });
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().code, 21712);
+  assert.match(response.json().message, new RegExp(serviceSid));
+  await server.close();
+});
+
+test("another account's number cannot be pooled", async () => {
+  const { server, store, auth, serviceSid } = await pooled();
+  const stranger = store.accounts.create({ friendlyName: 'stranger' });
+  const theirs = store.numbers.create({
+    phoneNumber: '+15558888888',
+    accountSid: stranger.accountSid,
+  });
+  const response = await server.app.inject({
+    method: 'POST',
+    url: `${MESSAGING}/Services/${serviceSid}/PhoneNumbers`,
+    headers: { authorization: auth, ...form },
+    payload: `PhoneNumberSid=${theirs.sid}`,
+  });
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json().code, 20404);
+  await server.close();
+});
+
+/** The messaging domain redirects whole; the part of it nothing fakes must say so. */
+test('an unfaked /v1 route answers 20501 and names the path', async () => {
+  const { server, auth } = await fixture();
+  const response = await server.app.inject({
+    url: `${MESSAGING}/Services/MG0/AlphaSenders`,
+    headers: { authorization: auth },
+  });
+  assert.equal(response.statusCode, 501);
+  assert.equal(response.json().code, 20501);
+  assert.match(response.json().message, /AlphaSenders/);
+  await server.close();
+});
+
+/**
+ * The `v1` twin of the `next_page_uri` test: the SDK's paginator follows
+ * `meta.next_page_url` on this domain, and stopping after one page reports a truncated
+ * set as the whole of it.
+ */
+test('the meta envelope carries the next page url and drops it on the last', async () => {
+  const { server, store, accountSid, auth } = await fixture();
+  for (const name of ['one', 'two', 'three']) {
+    store.messagingServices.create({ accountSid, friendlyName: name });
+  }
+  const first = await server.app.inject({
+    url: `${MESSAGING}/Services?PageSize=2&Page=0`,
+    headers: { authorization: auth },
+  });
+  assert.equal(first.json().services.length, 2);
+  assert.equal(first.json().meta.next_page_url, '/v1/Services?PageSize=2&Page=1');
+  assert.equal(first.json().meta.previous_page_url, null);
+
+  const last = await server.app.inject({
+    url: `${MESSAGING}/Services?PageSize=2&Page=1`,
+    headers: { authorization: auth },
+  });
+  assert.equal(last.json().services.length, 1);
+  assert.equal(last.json().meta.next_page_url, null);
+  await server.close();
+});

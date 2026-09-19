@@ -95,6 +95,29 @@
             </form>
             <div id="number-error" class="error" hidden></div>
             <div id="numbers"></div>
+
+            <h2>Messaging services</h2>
+            <p class="hint">
+              A <strong>pool</strong> of numbers that sends as one sender. A message sent
+              with this service's <code>MessagingServiceSid</code> and no <code>From</code>
+              goes out from a random number in the pool. An inbound URL here answers for
+              <em>every</em> number in it, instead of each number's own SMS URL &mdash;
+              leave it blank and joining a pool changes nothing about inbound.
+            </p>
+            <form id="service-form" class="stack">
+              <div class="fields">
+                <label>Name<input id="ms-name" type="text" placeholder="notifications" required /></label>
+                <label>Account<input id="ms-account" type="text" required placeholder="account" /></label>
+              </div>
+              <div class="fields">
+                <label>Inbound URL<input id="ms-inbound" type="url" placeholder="http://localhost:3000/sms" /></label>
+                <label class="narrow">Method<select id="ms-inbound-method"><option>POST</option><option>GET</option></select></label>
+                <label>Status callback<input id="ms-status" type="url" placeholder="http://localhost:3000/message-status" /></label>
+              </div>
+              <div class="actions"><button type="submit">Add messaging service</button></div>
+            </form>
+            <div id="service-error" class="error" hidden></div>
+            <div id="services"></div>
           </div>
         </div>
       </section>

@@ -21,7 +21,7 @@ function seeded(): { store: Store; accountSid: string } {
 
 test('the migration runs on an empty database and is idempotent', () => {
   const s = store();
-  assert.equal(s.db.pragma('user_version', { simple: true }), 4);
+  assert.equal(s.db.pragma('user_version', { simple: true }), 5);
   assert.deepEqual(s.accounts.list(), []);
 });
 
@@ -431,6 +431,135 @@ test('a thread previews its newest message, even within one second', () => {
   assert.equal(thread?.lastBody, 'the reply');
   assert.equal(thread?.lastFrom, '+15550000001');
   assert.equal(thread?.count, 2);
+});
+
+/* ------------------------------------------------------- messaging services */
+
+function pooled(): { store: Store; accountSid: string; serviceSid: string } {
+  const { store: s, accountSid } = seeded();
+  for (const phoneNumber of ['+15550000003', '+15550000002']) {
+    s.numbers.create({ phoneNumber, accountSid, smsUrl: 'http://app.test/sms' });
+  }
+  const service = s.messagingServices.create({ accountSid, friendlyName: 'support' });
+  for (const number of s.numbers.list(accountSid)) {
+    if (number.phoneNumber !== '+15550000001') {
+      s.messagingServices.addNumber(service.sid, number.sid);
+    }
+  }
+  return { store: s, accountSid, serviceSid: service.sid };
+}
+
+test('migration 5 adds the messaging service tables', () => {
+  const s = store();
+  const columns = (table: string): string[] =>
+    (s.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((c) => c.name);
+
+  for (const column of [
+    'sid',
+    'account_sid',
+    'friendly_name',
+    'inbound_request_url',
+    'inbound_method',
+    'status_callback_url',
+  ]) {
+    assert.ok(columns('messaging_services').includes(column), `messaging_services.${column}`);
+  }
+
+  // The cascade is what keeps `PhoneNumbers.remove()` — a bare DELETE that has never heard
+  // of services — from failing as an opaque SQLITE_CONSTRAINT. Asserted on the schema
+  // rather than only through behaviour, because this is the reason the behaviour works.
+  const keys = s.db.pragma('foreign_key_list(messaging_service_numbers)') as Array<{
+    table: string;
+    on_delete: string;
+  }>;
+  assert.equal(keys.length, 2);
+  for (const key of keys) {
+    assert.equal(key.on_delete, 'CASCADE', `${key.table} cascades`);
+  }
+});
+
+test('releasing a pooled number leaves the service and shrinks the pool', () => {
+  const { store: s, serviceSid } = pooled();
+  const [first] = s.messagingServices.numbers(serviceSid);
+  assert.ok(first);
+  assert.equal(s.numbers.remove(first.sid), true);
+  assert.equal(s.messagingServices.numberCount(serviceSid), 1);
+  assert.ok(s.messagingServices.find(serviceSid));
+});
+
+test('deleting a service leaves its numbers alone', () => {
+  const { store: s, accountSid, serviceSid } = pooled();
+  assert.equal(s.messagingServices.remove(serviceSid), true);
+  assert.equal(s.numbers.list(accountSid).length, 3);
+});
+
+test('a number is in at most one service', () => {
+  const { store: s, accountSid, serviceSid } = pooled();
+  const other = s.messagingServices.create({ accountSid, friendlyName: 'billing' });
+  const [member] = s.messagingServices.numbers(serviceSid);
+  assert.ok(member);
+  assert.equal(s.messagingServices.addNumber(other.sid, member.sid), 'taken');
+  assert.equal(s.messagingServices.addNumber(serviceSid, member.sid), 'already');
+  assert.equal(s.messagingServices.findForNumber(member.sid)?.sid, serviceSid);
+});
+
+test('pick is a seam, and an empty pool has no sender to invent', () => {
+  const { store: s, accountSid, serviceSid } = pooled();
+  // Ordered by number, so a pinned `rand` lands on the same row every run.
+  assert.equal(s.messagingServices.pick(serviceSid, () => 0)?.phoneNumber, '+15550000002');
+  assert.equal(s.messagingServices.pick(serviceSid, () => 0.99)?.phoneNumber, '+15550000003');
+  // `rand()` is [0, 1) by contract; a stub that returns 1 must still pick a member.
+  assert.equal(s.messagingServices.pick(serviceSid, () => 1)?.phoneNumber, '+15550000003');
+
+  const empty = s.messagingServices.create({ accountSid, friendlyName: 'empty' });
+  assert.equal(s.messagingServices.pick(empty.sid), null);
+});
+
+test('upsert keys on the pinned sid, then on the name', () => {
+  const { store: s, accountSid } = seeded();
+  const sid = 'MG' + 'a'.repeat(32);
+  s.messagingServices.upsert({ accountSid, sid, friendlyName: 'support' });
+  s.messagingServices.upsert({ accountSid, sid, friendlyName: 'renamed' });
+  assert.equal(s.messagingServices.list(accountSid).length, 1);
+  assert.equal(s.messagingServices.find(sid)?.friendlyName, 'renamed');
+
+  s.messagingServices.upsert({ accountSid, friendlyName: 'billing' });
+  s.messagingServices.upsert({
+    accountSid,
+    friendlyName: 'billing',
+    inboundRequestUrl: 'http://app.test/pool',
+  });
+  assert.equal(s.messagingServices.list(accountSid).length, 2);
+  assert.equal(
+    s.messagingServices.findByName(accountSid, 'billing')?.inboundRequestUrl,
+    'http://app.test/pool',
+  );
+});
+
+test('update clears a url with null and keeps it when unmentioned', () => {
+  const { store: s, accountSid } = seeded();
+  const service = s.messagingServices.create({
+    accountSid,
+    friendlyName: 'support',
+    inboundRequestUrl: 'http://app.test/pool',
+  });
+  assert.equal(
+    s.messagingServices.update(service.sid, { friendlyName: 'renamed' })?.inboundRequestUrl,
+    'http://app.test/pool',
+  );
+  assert.equal(
+    s.messagingServices.update(service.sid, { inboundRequestUrl: null })?.inboundRequestUrl,
+    null,
+  );
+});
+
+test('deleting an account takes its messaging services with it', () => {
+  const { store: s, accountSid, serviceSid } = pooled();
+  // Numbers still block the delete, services or no services.
+  assert.equal(s.accounts.remove(accountSid), 'has-numbers');
+  for (const number of s.numbers.list(accountSid)) s.numbers.remove(number.sid);
+  assert.equal(s.accounts.remove(accountSid), 'deleted');
+  assert.equal(s.messagingServices.find(serviceSid), null);
 });
 
 test('segment counting switches at the gsm-7 boundary', () => {

@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import type { Account, AccountStatus, ApiKey, PhoneNumber, Store } from '../db/index.js';
+import type { Account, AccountStatus, ApiKey, MessagingService, PhoneNumber, Store } from '../db/index.js';
 
 /**
  * Managing the simulator itself: the accounts it holds, the API keys that open them and
@@ -93,10 +93,45 @@ const keyBody = z.object({
 /** The name is the only thing about a key that changes; the account and the secret do not. */
 const keyPatch = keyBody.partial().pick({ friendly_name: true });
 
-/** Accounts and numbers together — the shape of the seed file and of `POST /admin/seed`. */
+/**
+ * A Messaging Service: a pool of numbers that sends as one sender.
+ *
+ * `phone_numbers` states the pool in E.164 rather than in `PN…`, because that is what a
+ * person writing a seed file or filling in this form actually knows.
+ */
+const messagingServiceBody = z.object({
+  account_sid: z.string().min(1),
+  friendly_name: z.string().max(200).optional(),
+  sid: z.string().regex(/^MG[0-9a-f]{32}$/).optional(),
+  inbound_request_url: urlOrNull,
+  inbound_method: method,
+  status_callback_url: urlOrNull,
+  phone_numbers: z.array(e164).optional(),
+});
+
+/**
+ * The account is fixed at creation, the way an account's parent is — a pool is one
+ * account's, because `sms.ts` signs a pooled delivery with that one account's token.
+ * `.strict()` for the same reason `accountPatch` is: a PATCH naming it must say so rather
+ * than answer `200` and change nothing.
+ */
+const messagingServicePatch = messagingServiceBody
+  .partial()
+  .omit({ sid: true, account_sid: true, phone_numbers: true })
+  .strict();
+
+/** Which number to put in a pool, or take out of one. */
+const poolBody = z.object({
+  phone_number_sid: z.string().regex(/^PN[0-9a-f]{32}$/),
+});
+
+/** Accounts, numbers and services — the shape of the seed file and of `POST /admin/seed`. */
 export const seedSchema = z.object({
   accounts: z.array(accountBody.extend({ account_sid: z.string().optional() })).default([]),
   numbers: z.array(numberBody.partial({ account_sid: true })).default([]),
+  messaging_services: z
+    .array(messagingServiceBody.partial({ account_sid: true }))
+    .default([]),
 });
 
 export type Seed = z.infer<typeof seedSchema>;
@@ -140,6 +175,32 @@ export function numberView(number: PhoneNumber): Record<string, unknown> {
   };
 }
 
+/**
+ * A service and its pool in one object.
+ *
+ * The pool is inlined rather than left to a second request because the Admin panel draws
+ * the chips from the same two-second poll that draws the card, and a second round trip per
+ * card is how a list of ten becomes eleven requests a tick.
+ */
+export function messagingServiceView(
+  service: MessagingService,
+  store: Store,
+): Record<string, unknown> {
+  return {
+    sid: service.sid,
+    account_sid: service.accountSid,
+    friendly_name: service.friendlyName,
+    inbound_request_url: service.inboundRequestUrl,
+    inbound_method: service.inboundMethod,
+    status_callback_url: service.statusCallbackUrl,
+    phone_numbers: store.messagingServices
+      .numbers(service.sid)
+      .map((number) => ({ sid: number.sid, phone_number: number.phoneNumber })),
+    created_at: service.createdAt,
+    updated_at: service.updatedAt,
+  };
+}
+
 export function keyView(key: ApiKey, reveal = false): Record<string, unknown> {
   return {
     sid: key.sid,
@@ -174,6 +235,54 @@ function parentRefusal(
     return {
       error: 'not_a_parent',
       message: `${parentAccountSid} is itself a subaccount, and a subaccount cannot hold subaccounts`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Why a number will not go in this pool, or `null` if it will.
+ *
+ * Two refusals. **A pool is one account's** — `sms.ts` signs a pooled delivery with the
+ * one account's token, and a member from elsewhere would be delivered signed with a token
+ * the application under test does not verify with, which is a blanket 403 at the far end
+ * with nothing naming why. And **a number is in at most one service**, which is Twilio's
+ * own rule and what makes inbound resolution a single answer; the refusal names the `MG…`
+ * in the way, the way the numbers' `exists` names the `PN…`.
+ */
+function poolRefusal(
+  store: Store,
+  accountSid: string,
+  phoneNumber: string,
+  serviceSid?: string,
+): { code: number; body: { error: string; message: string } } | null {
+  const number = store.numbers.findByNumber(phoneNumber);
+  if (!number) {
+    return {
+      code: 400,
+      body: {
+        error: 'no_such_number',
+        message: `${phoneNumber} is not a number this simulator holds`,
+      },
+    };
+  }
+  if (number.accountSid !== accountSid) {
+    return {
+      code: 400,
+      body: {
+        error: 'wrong_account',
+        message: `${phoneNumber} is held by ${number.accountSid}, and a pool is one account's`,
+      },
+    };
+  }
+  const holder = store.messagingServices.findForNumber(number.sid);
+  if (holder && holder.sid !== serviceSid) {
+    return {
+      code: 409,
+      body: {
+        error: 'in_another_service',
+        message: `${phoneNumber} is already in messaging service ${holder.sid}`,
+      },
     };
   }
   return null;
@@ -350,6 +459,125 @@ export function registerAdmin(app: FastifyInstance, store: Store): void {
 
   /* --------------------------------------------------------------- api keys */
 
+  /* ------------------------------------------------------ messaging services */
+
+  app.get('/admin/messaging-services', async (request) => {
+    const { account_sid: accountSid } = request.query as { account_sid?: string };
+    return {
+      messaging_services: store.messagingServices
+        .list(accountSid)
+        .map((service) => messagingServiceView(service, store)),
+    };
+  });
+
+  app.get('/admin/messaging-services/:sid', async (request, reply) => {
+    const { sid } = request.params as { sid: string };
+    const service = store.messagingServices.find(sid);
+    if (!service) return reply.code(404).send({ error: 'not_found' });
+    return messagingServiceView(service, store);
+  });
+
+  app.post('/admin/messaging-services', async (request, reply) => {
+    const parsed = messagingServiceBody.safeParse(request.body ?? {});
+    if (!parsed.success) return invalid(reply, parsed.error);
+    const body = parsed.data;
+    if (store.accounts.find(body.account_sid) === null) {
+      return reply.code(400).send({
+        error: 'no_such_account',
+        message: `${body.account_sid} is not an account this simulator holds`,
+      });
+    }
+    if (body.sid && store.messagingServices.find(body.sid) !== null) {
+      return reply.code(409).send({
+        error: 'exists',
+        message: `${body.sid} is already a messaging service`,
+      });
+    }
+    // **Every named number is resolved before anything is written.** A pool stated up
+    // front is one intention; half of it applied and the rest refused is a service the
+    // person did not ask for, sitting there looking as though it worked.
+    const members: PhoneNumber[] = [];
+    for (const phoneNumber of body.phone_numbers ?? []) {
+      const refusal = poolRefusal(store, body.account_sid, phoneNumber);
+      if (refusal) return reply.code(refusal.code).send(refusal.body);
+      const number = store.numbers.findByNumber(phoneNumber);
+      if (number) members.push(number);
+    }
+
+    const service = store.db.transaction(() => {
+      const created = store.messagingServices.create({
+        accountSid: body.account_sid,
+        sid: body.sid,
+        friendlyName: body.friendly_name,
+        inboundRequestUrl: body.inbound_request_url,
+        inboundMethod: body.inbound_method,
+        statusCallbackUrl: body.status_callback_url,
+      });
+      for (const number of members) store.messagingServices.addNumber(created.sid, number.sid);
+      return created;
+    })();
+    return reply.code(201).send(messagingServiceView(service, store));
+  });
+
+  app.patch('/admin/messaging-services/:sid', async (request, reply) => {
+    const { sid } = request.params as { sid: string };
+    const parsed = messagingServicePatch.safeParse(request.body ?? {});
+    if (!parsed.success) return invalid(reply, parsed.error);
+    const body = parsed.data;
+    const updated = store.messagingServices.update(sid, {
+      friendlyName: body.friendly_name,
+      inboundRequestUrl: body.inbound_request_url,
+      inboundMethod: body.inbound_method,
+      statusCallbackUrl: body.status_callback_url,
+    });
+    if (!updated) return reply.code(404).send({ error: 'not_found' });
+    return messagingServiceView(updated, store);
+  });
+
+  /**
+   * Delete a service, pool and all.
+   *
+   * No guard on a non-empty pool, unlike an account holding numbers: the pool rows are the
+   * service's own and go with it, the numbers are untouched, and the messages that named
+   * the `MG…` keep it as text. It is the same bargain `DELETE /admin/keys/:sid` makes.
+   */
+  app.delete('/admin/messaging-services/:sid', async (request, reply) => {
+    const { sid } = request.params as { sid: string };
+    if (!store.messagingServices.remove(sid)) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    return reply.code(204).send();
+  });
+
+  app.post('/admin/messaging-services/:sid/numbers', async (request, reply) => {
+    const { sid } = request.params as { sid: string };
+    const service = store.messagingServices.find(sid);
+    if (!service) return reply.code(404).send({ error: 'not_found' });
+    const parsed = poolBody.safeParse(request.body ?? {});
+    if (!parsed.success) return invalid(reply, parsed.error);
+    const number = store.numbers.find(parsed.data.phone_number_sid);
+    if (!number) {
+      return reply.code(400).send({
+        error: 'no_such_number',
+        message: `${parsed.data.phone_number_sid} is not a number this simulator holds`,
+      });
+    }
+    const refusal = poolRefusal(store, service.accountSid, number.phoneNumber, service.sid);
+    if (refusal) return reply.code(refusal.code).send(refusal.body);
+    store.messagingServices.addNumber(service.sid, number.sid);
+    return reply.code(201).send(messagingServiceView(service, store));
+  });
+
+  app.delete('/admin/messaging-services/:sid/numbers/:numberSid', async (request, reply) => {
+    const { sid, numberSid } = request.params as { sid: string; numberSid: string };
+    const service = store.messagingServices.find(sid);
+    if (!service) return reply.code(404).send({ error: 'not_found' });
+    if (!store.messagingServices.removeNumber(service.sid, numberSid)) {
+      return reply.code(404).send({ error: 'not_in_service' });
+    }
+    return reply.code(204).send();
+  });
+
   app.get('/admin/keys', async (request) => {
     const { account_sid: accountSid } = request.query as { account_sid?: string };
     return { keys: store.apiKeys.list(accountSid).map((key) => keyView(key)) };
@@ -426,7 +654,7 @@ export function registerAdmin(app: FastifyInstance, store: Store): void {
  * that exists. That is the common case — one account, several numbers — and spelling the
  * sid on every entry would mean editing the file whenever an account is re-minted.
  */
-export function applySeed(store: Store, seed: Seed): { accounts: number; numbers: number } {
+export function applySeed(store: Store, seed: Seed): { accounts: number; numbers: number; messaging_services: number } {
   // **Two passes**, because a seed file may list a child before its parent and neither
   // order is wrong. The first creates every account; the second links the children, by
   // which point every sid the file names exists.
@@ -480,5 +708,49 @@ export function applySeed(store: Store, seed: Seed): { accounts: number; numbers
     });
     numbers += 1;
   }
-  return { accounts: accounts.length, numbers };
+
+  // **A third pass, after the numbers**, because a pool names numbers the same file may
+  // have just created. `upsert` keys on the pinned sid, or on the name — never on nothing,
+  // since a seed is re-applied on every start and a service re-minted each boot would
+  // orphan the `MG…` sitting in the application's own configuration.
+  let messagingServices = 0;
+  for (const entry of seed.messaging_services) {
+    const accountSid = entry.account_sid ?? fallback;
+    if (!accountSid) {
+      throw new Error(
+        `the seed names the messaging service ${entry.friendly_name ?? '(unnamed)'} but no account_sid, and there is not exactly one account to fall back to`,
+      );
+    }
+    const service = store.messagingServices.upsert({
+      accountSid,
+      sid: entry.sid,
+      friendlyName: entry.friendly_name,
+      inboundRequestUrl: entry.inbound_request_url,
+      inboundMethod: entry.inbound_method,
+      statusCallbackUrl: entry.status_callback_url,
+    });
+    // **The pool is declarative**: the file states what it is, so re-applying converges
+    // rather than piling members up. Stated as nothing at all, it is left alone — an
+    // absent key is not the same as an empty list.
+    if (entry.phone_numbers) {
+      for (const number of store.messagingServices.numbers(service.sid)) {
+        if (!entry.phone_numbers.includes(number.phoneNumber)) {
+          store.messagingServices.removeNumber(service.sid, number.sid);
+        }
+      }
+      for (const phoneNumber of entry.phone_numbers) {
+        const refusal = poolRefusal(store, accountSid, phoneNumber, service.sid);
+        if (refusal) {
+          throw new Error(
+            `the seed puts ${phoneNumber} in ${service.sid}, but ${refusal.body.message}`,
+          );
+        }
+        const held = store.numbers.findByNumber(phoneNumber);
+        if (held) store.messagingServices.addNumber(service.sid, held.sid);
+      }
+    }
+    messagingServices += 1;
+  }
+
+  return { accounts: accounts.length, numbers, messaging_services: messagingServices };
 }

@@ -93,7 +93,7 @@ on `main` (`:main`), for `linux/amd64` and `linux/arm64`.
 | panel | what it does |
 | --- | --- |
 | **Phone** | one of your numbers, as a handset. Calls waiting to be picked up sit across the top; pick a number under them and everything below is its own: its calls on the left, the keypad in the middle, its conversations on the right. |
-| **Admin** | accounts, API keys and phone numbers. Create an account to get a sid and token, name a parent to make it a subaccount, mint a key if the application under test is built with one, add numbers and edit their webhook URLs in place. Subaccounts sit indented under their parent, with a status you can suspend from here. This is the only configuration there is. |
+| **Admin** | accounts, API keys, phone numbers and messaging services. Create an account to get a sid and token, name a parent to make it a subaccount, mint a key if the application under test is built with one, add numbers and edit their webhook URLs in place, and pool numbers into a messaging service. Subaccounts sit indented under their parent, with a status you can suspend from here. This is the only configuration there is. |
 
 ![The Phone panel — picker, calls, keypad and conversations](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview1.jpg)
 
@@ -205,6 +205,28 @@ comes back `sent`, one to a held number with no `sms_url` comes back `delivered`
 webhook that refuses comes back `failed` with `ErrorCode=30003`. A `<Message>` reply is its
 own message and does not inherit the callback of the message that prompted it.
 
+### Messaging Services
+
+A **messaging service** is a pool of your numbers that sends as one sender. Send with its
+`MessagingServiceSid` and no `From` and localio picks a number out of the pool at random,
+which is the behaviour an application testing a sender pool is actually looking for; the
+sid is echoed back on the message either way. A `From` you name yourself still wins. A
+service whose pool is empty has no sender to invent, so it answers `21703` rather than
+sending from nothing, and a service belonging to another account is a `20404` like any
+other sid across that boundary.
+
+The other half is inbound. Give the service an `inbound_request_url` and **every number in
+the pool answers there** instead of at its own `sms_url` — one handler for many numbers,
+which is the point of a pool — and the webhook carries `MessagingServiceSid` so your
+routing can tell one pool from another. Leave it blank and joining a pool changes nothing
+about inbound: a number keeps answering where it did. A service may also carry a
+`StatusCallback`, used for any message sent through it that named none of its own.
+
+A pool is one account's, and a number is in at most one service — both are Twilio's rules,
+and the first is also what lets localio sign a pooled delivery with a single auth token.
+Releasing a number takes it out of its pool; deleting a service leaves every number, and
+its URLs, exactly as they were.
+
 ## The routes
 
 ### `/2010-04-01` — the Twilio REST API
@@ -239,7 +261,7 @@ exists. Lists carry Twilio's full envelope (`first_page_uri`, `next_page_uri`, `
 | `GET Calls.json` | lists this account's calls. `PageSize`, `Page` and `Status` narrow it. |
 | `GET Calls/:sid.json` | one call. Reports `in-progress` while the sid is live. |
 | `POST Calls/:sid.json` | `Status=completed` ends a live call and `canceled` drops a queued one, through the same teardown as any other hang-up. `Url` and `Twiml` are logged but do **not** redirect a live call. |
-| `POST Messages.json` | sends, and actually delivers to the destination's `sms_url`. `StatusCallback` is honoured per message, signed with the sending account's token. |
+| `POST Messages.json` | sends, and actually delivers to the destination's `sms_url`. `StatusCallback` is honoured per message, signed with the sending account's token. `MessagingServiceSid` **resolves a sender**: with no `From`, the message goes out from a random number in that service's pool, and the service's own `StatusCallback` is the fallback. |
 | `GET Messages.json` | lists messages. `To`, `From`, `PageSize` and `Page` narrow it. |
 | `GET Messages/:sid.json` | one message. |
 | `GET POST Keys.json` | list and mint API keys. The create is the only answer that carries the `secret` — a read never does, exactly as at Twilio. |
@@ -255,7 +277,37 @@ Responses are snake_case with RFC 2822 timestamps and `duration` as a string, be
 is what the Twilio SDK's own deserializer expects; anything no simulator can know (`price`,
 `answered_by`, `caller_name`) is `null` rather than a plausible value.
 
-### `/admin` — accounts, keys and numbers
+### `/v1` — Messaging Services
+
+Twilio keeps Messaging Services on a **different domain** from everything above —
+`messaging.twilio.com/v1` rather than `api.twilio.com/2010-04-01` — and the SDK points it
+separately, so a client that already talks to localio needs one more line:
+
+```js
+client.messaging.baseUrl = 'http://127.0.0.1:8080';
+```
+
+Same HTTP Basic, and a key works here too. **There is no `/Accounts/:sid` in these paths**,
+which is the one way this family differs: with no account in the URL, the credential *is*
+the account, so a parent's credentials act as the parent and there is no path in which to
+name a child. The answers wear that domain's shape rather than the one above — ISO 8601
+timestamps, and `meta.next_page_url` instead of `next_page_uri` — because that is what the
+SDK's deserializer for this domain reads.
+
+| | |
+| --- | --- |
+| `POST GET /v1/Services` | create and list. `FriendlyName` is required; `InboundRequestUrl`, `InboundMethod` and `StatusCallback` are honoured. |
+| `GET POST /v1/Services/:sid` | fetch and update. The update is a `POST`, because that is what the SDK sends; an empty URL field clears it. |
+| `DELETE /v1/Services/:sid` | delete. The pool goes; the numbers and the message history stay. |
+| `POST GET /v1/Services/:sid/PhoneNumbers` | put a number in the pool, by `PhoneNumberSid`, and list what is in it. Another account's number is a `20404`; one already in a service is a `409` with `21712`, naming the service holding it. Adding a number already in *this* pool just answers it. |
+| `DELETE /v1/Services/:sid/PhoneNumbers/:sid` | take a number out of the pool. |
+| anything else under `/v1` | **`501`**, naming the path — the messaging domain redirects whole, and only Services is faked. |
+
+The fields Twilio always sends (`sticky_sender`, `smart_encoding`, `usecase` and the rest)
+are answered at their defaults so a client reading them gets a value rather than
+`undefined`. None of them are honoured.
+
+### `/admin` — accounts, keys, numbers and messaging services
 
 Unauthenticated, and the reason this binds loopback — see **What it is not**. JSON in, JSON
 out; a bad field answers `400` naming it.
@@ -268,6 +320,10 @@ out; a bad field answers `400` naming it.
 | `GET PATCH DELETE /admin/keys/:sid` | fetch, rename, delete. `?reveal=1` is the only **read** that returns the `secret`. |
 | `GET POST /admin/numbers` | list and provision. `account_sid` narrows the list. |
 | `GET PATCH DELETE /admin/numbers/:sid` | fetch, update, release. A blank URL field clears it, an absent one keeps it; the number itself cannot be changed. Releasing keeps the call and message history. |
+| `GET POST /admin/messaging-services` | list and create. `account_sid` narrows the list. `phone_numbers` states the pool in E.164; a name in it that is not held, or is held by another account, is a `400` **before anything is written**. |
+| `GET PATCH DELETE /admin/messaging-services/:sid` | fetch, update, delete. The sid and the account are fixed at creation, and a `PATCH` naming either is a `400` rather than a silent no-op. Deleting takes the pool and nothing else: the numbers keep their own URLs and the messages keep the sid. |
+| `POST /admin/messaging-services/:sid/numbers` | put a number in the pool, by `phone_number_sid`. Another account's number is a `400`, and one already in a service is a `409` naming the `MG…` in the way. |
+| `DELETE /admin/messaging-services/:sid/numbers/:numberSid` | take it out again. |
 | `POST /admin/seed` | the same file `--seed` reads, over HTTP. It upserts, so running it twice is not an error. |
 
 ### `/api` — what the UI draws
@@ -406,13 +462,21 @@ connection, a timeout — is a `warn` rather than a status, as is a `/2010-04-01
 localio does not fake. `--log-level debug` adds the bodies to both: the request form and
 the response payload for a REST call, and the signed parameters and the returned document
 for a webhook, each truncated. Nothing logs a request header, so an account's auth token
-does not end up in a paste of the terminal. Only `/2010-04-01` is logged — the Phone
-panel's own polling of `/api` stays silent, which is what keeps a live call readable.
+does not end up in a paste of the terminal. Only `/2010-04-01` and `/v1` are logged — the
+Phone panel's own polling of `/api` stays silent, which is what keeps a live call
+readable.
 
 There is no encryption key and no secret that is not a row — auth tokens and API key
 secrets are both stored as they are typed: localio **is** the account holder. Keys are not
-seedable; the seed file pins accounts and numbers only. A seeded account may name a
-`parent_account_sid`, in either order — the parent may be listed after the child.
+seedable; the seed file pins accounts, numbers and messaging services. A seeded account may
+name a `parent_account_sid`, in either order — the parent may be listed after the child.
+
+A `messaging_services` entry pins an `MG…` the same way an account pins its sid, so the one
+in your application's own configuration keeps working across restarts; without a `sid` it
+is keyed by `friendly_name` instead, and never re-minted on a second run. Its
+`phone_numbers` list is **declarative** — it is what the pool becomes, so re-applying
+converges rather than piling members up — and it is applied after the numbers, so it may
+name ones the same file has just created.
 
 ## What it is not
 
@@ -436,8 +500,10 @@ seedable; the seed file pins accounts and numbers only. A seeded account may nam
 - **No answering machine detection.** `AnsweredBy` is always `null` and `MachineDetection`
   is ignored. Nor is there a ring timeout: `Timeout` is ignored and a queued call waits
   until a tab takes it or somebody declines it.
-- **No Messaging Services.** A `MessagingServiceSid` is stored and echoed back, not
-  resolved to a sender pool.
+- **Not a full Messaging Service.** The pool and the shared inbound URL are real; the rest
+  of Twilio's service resource is answered at its defaults and honoured nowhere. There is no
+  sticky sender, no smart encoding, no area-code geomatch, no scheduling and no A2P
+  registration.
 - 
 ## License
 

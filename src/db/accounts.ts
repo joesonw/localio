@@ -189,11 +189,13 @@ export class Accounts {
    * `foreign_keys = ON` would refuse this anyway, with `SQLITE_CONSTRAINT` and nothing
    * naming what was in the way. Checking first is what lets the refusal say how many.
    *
-   * **API keys go with it**, and numbers do not, because the two are different kinds of
-   * thing: a key is a credential *for* this account and means nothing without it, while a
-   * number is a resource with history on it that outlives whoever held it. Both are
-   * foreign keys into this table, so the keys have to go in the same transaction or the
-   * delete is the opaque `SQLITE_CONSTRAINT` this method exists to avoid.
+   * **API keys and messaging services go with it**, and numbers do not, because the two
+   * are different kinds of thing: a key is a credential *for* this account and a service is
+   * configuration *of* it, and neither means anything without it, while a number is a
+   * resource with history on it that outlives whoever held it. All are foreign keys into
+   * this table, so they have to go in the same transaction or the delete is the opaque
+   * `SQLITE_CONSTRAINT` this method exists to avoid. The messages that named a service keep
+   * its sid as text, the same way they keep a released number.
    *
    * **A subaccount is neither**, and is not taken along: it is an account in its own
    * right, with its own token and its own numbers, and deleting a parent must not quietly
@@ -206,6 +208,8 @@ export class Accounts {
     if (this.numberCount(accountSid) > 0) return 'has-numbers';
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM api_keys WHERE account_sid = ?').run(accountSid);
+      // Pool rows cascade off this one.
+      this.db.prepare('DELETE FROM messaging_services WHERE account_sid = ?').run(accountSid);
       this.db.prepare('DELETE FROM accounts WHERE account_sid = ?').run(accountSid);
     })();
     return 'deleted';

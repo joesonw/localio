@@ -111,7 +111,20 @@ export class SmsService {
       };
     }
 
-    if (!destination.smsUrl) {
+    // **A pool's inbound URL wins over the number's own**, which is the whole point of a
+    // pool: one handler for many numbers, instead of the same `sms_url` pasted onto each.
+    // A service with no `inbound_request_url` changes nothing here — joining a pool must
+    // never silently move a number's inbound traffic somewhere it was not told about.
+    //
+    // This sits *above* the `smsUrl` check on purpose: below it, a pooled number with no
+    // `sms_url` of its own would be answered `delivered` and never reach the pool's handler
+    // at all, which is the one arrangement a pool is most likely to be set up as.
+    const service = this.store.messagingServices.findForNumber(destination.sid);
+    const inbound = service?.inboundRequestUrl
+      ? { url: service.inboundRequestUrl, method: service.inboundMethod, via: service.sid }
+      : { url: destination.smsUrl, method: destination.smsMethod, via: null };
+
+    if (!inbound.url) {
       return {
         message: await this.settle(message, 'delivered'),
         webhook: null,
@@ -131,7 +144,10 @@ export class SmsService {
     }
 
     const result = await this.poster.post(
-      destination.smsUrl,
+      inbound.url,
+      // The **destination account's** token, pool or no pool: it is that application
+      // verifying this signature. A pool cannot straddle accounts — every write site
+      // refuses it — so the service never moves which token this is.
       account.authToken,
       messageForm({
         messageSid: message.sid,
@@ -140,8 +156,9 @@ export class SmsService {
         to: message.to,
         body: message.body,
         numSegments: message.numSegments,
+        messagingServiceSid: inbound.via,
       }),
-      destination.smsMethod === 'GET' ? 'GET' : 'POST',
+      inbound.method === 'GET' ? 'GET' : 'POST',
       { kind: 'message', messageSid: message.sid },
     );
 

@@ -6,7 +6,7 @@ import type { CallFeed } from '../call-feed.js';
 import { parseEventRequest, postCallStatus } from '../call-status.js';
 import type { Config } from '../config.js';
 import { preview } from '../log.js';
-import type { Account, AccountStatus, ApiKey, Call, Message, PhoneNumber, Recording, Store } from '../db/index.js';
+import type { Account, AccountStatus, ApiKey, Call, Message, MessagingService, PhoneNumber, Recording, Store } from '../db/index.js';
 import type { SmsService } from '../sms.js';
 import type { WebhookPoster } from '../webhook.js';
 
@@ -44,6 +44,17 @@ import type { WebhookPoster } from '../webhook.js';
  */
 
 const API = '/2010-04-01';
+
+/**
+ * Twilio's messaging domain, which is a **different base URL** from the one above.
+ *
+ * `messaging.twilio.com/v1` is where Messaging Services live, and an SDK client points it
+ * separately: `client.messaging.baseUrl = 'http://127.0.0.1:8080'`. Two things follow, and
+ * both are deliberate — **there is no `/Accounts/:sid` in these paths**, so the credential
+ * *is* the account (see `authenticateSelf`), and the `v1` domains answer in their own
+ * shape: `meta` rather than the `/2010-04-01` page envelope, ISO 8601 rather than RFC 2822.
+ */
+const MESSAGING = '/v1';
 
 /** The statuses `POST Accounts/:sid.json` will accept. `active` is the only one that opens. */
 const STATUSES: AccountStatus[] = ['active', 'suspended', 'closed'];
@@ -120,6 +131,49 @@ function rfc2822(seconds: number | null): string | null {
   return seconds === null ? null : new Date(seconds * 1000).toUTCString();
 }
 
+/**
+ * ISO 8601, which is what the **`v1`** domains send. `/2010-04-01` and only it is RFC 2822.
+ *
+ * Not a style choice on either side: each domain's deserializer in the SDK parses the one
+ * its own API sends, and a date in the other spelling comes back as an invalid `Date`.
+ */
+function iso8601(seconds: number | null): string | null {
+  return seconds === null ? null : new Date(seconds * 1000).toISOString();
+}
+
+/**
+ * The **other** list envelope: `meta`, which is what every `v1` domain sends.
+ *
+ * The same failure as `pageEnvelope`'s in the other domain's spelling — the SDK's
+ * auto-paginator follows `meta.next_page_url` here and `next_page_uri` there, and handed
+ * the wrong one it stops after a page and reports a truncated set as the whole of it.
+ */
+function metaEnvelope<T>(
+  key: string,
+  path: string,
+  rows: T[],
+  page: number,
+  pageSize: number,
+): Record<string, unknown> {
+  const start = page * pageSize;
+  const slice = rows.slice(start, start + pageSize);
+  const hasMore = start + slice.length < rows.length;
+  const at = (n: number): string => `${path}?PageSize=${pageSize}&Page=${n}`;
+  return {
+    [key]: slice,
+    meta: {
+      page,
+      page_size: pageSize,
+      first_page_url: at(0),
+      previous_page_url: page > 0 ? at(page - 1) : null,
+      url: at(page),
+      next_page_url: hasMore ? at(page + 1) : null,
+      // Which property of this object holds the rows. The SDK reads it to find them.
+      key,
+    },
+  };
+}
+
 export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
   const { store, sms, config, logger, feed, poster, endCall } = deps;
 
@@ -139,7 +193,9 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
    * live auth token, and a log line is the easiest thing in the world to paste.
    */
   function ours(request: FastifyRequest): boolean {
-    return request.url.startsWith(API);
+    // Both prefixes, because a `/v1` path localio does not fake must show up in the one log
+    // that names it. A `501` nobody can see is a 404 with extra steps.
+    return request.url.startsWith(API) || request.url.startsWith(MESSAGING);
   }
 
   app.addHook('onResponse', async (request, reply) => {
@@ -477,7 +533,40 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     if (body.Body === undefined) {
       return twilioError(reply, 400, 21602, 'Message body is required');
     }
-    const from = body.From ?? body.MessagingServiceSid ?? '';
+    // **A Messaging Service resolves a sender; it never becomes one.** This used to read
+    // `body.From ?? body.MessagingServiceSid`, which put an `MG…` into the message's
+    // `from_number` column — where `findByNumber`, `usage()` and every thread view read it
+    // as a phone number and found nothing, with no error raised anywhere.
+    let from = body.From ?? '';
+    let service: MessagingService | null = null;
+    if (body.MessagingServiceSid) {
+      // Through `owned()` like every other sid here, even though this one arrives in the
+      // body rather than the path: across an account boundary it does not exist.
+      service = owned(
+        reply,
+        account,
+        store.messagingServices.find(body.MessagingServiceSid),
+        'Service',
+        body.MessagingServiceSid,
+      );
+      if (!service) return;
+    }
+    if (!from && service) {
+      const sender = store.messagingServices.pick(service.sid);
+      // An empty pool has no sender to invent, and Twilio says so with this code rather
+      // than sending from nothing.
+      if (!sender) {
+        return twilioError(
+          reply,
+          400,
+          21703,
+          `Messaging Service ${service.sid} has no phone numbers to send from`,
+        );
+      }
+      from = sender.phoneNumber;
+    }
+    // `From` wins when both are named, as at Twilio — the service is still echoed on the
+    // resource, because the request named one and a later read cannot tell otherwise.
     if (!from) return twilioError(reply, 400, 21603, "A 'From' phone number is required");
 
     // Delivery is awaited so the row is settled before the answer, but the *status* in
@@ -489,7 +578,9 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
       body: body.Body,
       accountSid: account.accountSid,
       direction: 'outbound-api',
-      statusCallbackUrl: body.StatusCallback ?? null,
+      // The service's own callback is the fallback for a send that named none — the one
+      // read of that column, so it is not a field stored and never looked at.
+      statusCallbackUrl: body.StatusCallback ?? service?.statusCallbackUrl ?? null,
       messagingServiceSid: body.MessagingServiceSid ?? null,
     });
     return reply.code(201).send(messageResource({ ...result.message, status: 'queued' }));
@@ -975,6 +1066,170 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
     return reply.send(accountResource(updated));
   });
 
+  /* ------------------------------------------------- messaging services (/v1) */
+
+  /**
+   * Messaging Services: a pool of numbers that sends as one sender.
+   *
+   * **No account sid in the path**, which is the one thing that makes this family
+   * different from everything above it. `messaging.twilio.com/v1/Services` has none, so
+   * there is no path account to return and `authenticateSelf` hands back the *credential's*
+   * account instead. A parent's credentials therefore act as the **parent** here, never as
+   * a child — there is no path in which to name one. It is the single family where the
+   * "the account in the path wins" rule has no path to obey, and Twilio's messaging domain
+   * behaves the same way.
+   *
+   * Registered on this instance rather than in a file of its own so it can use
+   * `twilioError`, `owned` and `paging` — all closures over `store` — instead of growing a
+   * second error envelope, which is how two error *shapes* appear.
+   */
+  const ownService = (
+    reply: FastifyReply,
+    account: Account,
+    sid: string,
+  ): MessagingService | null =>
+    owned(reply, account, store.messagingServices.find(sid), 'Service', sid);
+
+  app.post(`${MESSAGING}/Services`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const body = request.body as Record<string, string>;
+    if (!body?.FriendlyName) {
+      return twilioError(reply, 400, 20001, "A 'FriendlyName' is required");
+    }
+    const service = store.messagingServices.create({
+      accountSid: account.accountSid,
+      friendlyName: body.FriendlyName,
+      inboundRequestUrl: body.InboundRequestUrl || null,
+      inboundMethod: body.InboundMethod === 'GET' ? 'GET' : 'POST',
+      statusCallbackUrl: body.StatusCallback || null,
+    });
+    return reply.code(201).send(serviceResource(service));
+  });
+
+  app.get(`${MESSAGING}/Services`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { page, pageSize } = paging(request.query as { PageSize?: string; Page?: string });
+    const rows = store.messagingServices.list(account.accountSid).map(serviceResource);
+    return reply.send(metaEnvelope('services', `${MESSAGING}/Services`, rows, page, pageSize));
+  });
+
+  app.get(`${MESSAGING}/Services/:serviceSid`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { serviceSid } = request.params as { serviceSid: string };
+    const service = ownService(reply, account, serviceSid);
+    if (!service) return;
+    return reply.send(serviceResource(service));
+  });
+
+  /** A `POST`, because that is what the SDK sends for an update. `''` clears a URL. */
+  app.post(`${MESSAGING}/Services/:serviceSid`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { serviceSid } = request.params as { serviceSid: string };
+    if (!ownService(reply, account, serviceSid)) return;
+    const body = (request.body ?? {}) as Record<string, string>;
+    // `undefined` keeps the value, `null` clears it — and an empty string is what a
+    // cleared box arrives as over a form post, which is the only way to clear one here.
+    const url = (value: string | undefined): string | null | undefined =>
+      value === undefined ? undefined : value || null;
+    const updated = store.messagingServices.update(serviceSid, {
+      friendlyName: body.FriendlyName,
+      inboundRequestUrl: url(body.InboundRequestUrl),
+      inboundMethod: body.InboundMethod,
+      statusCallbackUrl: url(body.StatusCallback),
+    });
+    if (!updated) return twilioError(reply, 404, 20404, `Service ${serviceSid} was not found`);
+    return reply.send(serviceResource(updated));
+  });
+
+  /** The pool rows cascade. The numbers keep their own `sms_url`, and the history stays. */
+  app.delete(`${MESSAGING}/Services/:serviceSid`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { serviceSid } = request.params as { serviceSid: string };
+    if (!ownService(reply, account, serviceSid)) return;
+    store.messagingServices.remove(serviceSid);
+    return reply.code(204).send();
+  });
+
+  app.post(`${MESSAGING}/Services/:serviceSid/PhoneNumbers`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { serviceSid } = request.params as { serviceSid: string };
+    const service = ownService(reply, account, serviceSid);
+    if (!service) return;
+    const body = request.body as Record<string, string>;
+    if (!body?.PhoneNumberSid) {
+      return twilioError(reply, 400, 20001, "A 'PhoneNumberSid' is required");
+    }
+    // Another account's number is a `20404` like any other sid across that boundary — and
+    // it is also what keeps a pool inside one account, which is what lets `sms.ts` sign a
+    // pooled delivery with a single token.
+    const number = owned(
+      reply,
+      account,
+      store.numbers.find(body.PhoneNumberSid),
+      'PhoneNumber',
+      body.PhoneNumberSid,
+    );
+    if (!number) return;
+    const outcome = store.messagingServices.addNumber(service.sid, number.sid);
+    if (outcome === 'taken') {
+      const holder = store.messagingServices.findForNumber(number.sid);
+      return twilioError(
+        reply,
+        409,
+        21712,
+        `${number.phoneNumber} is already in Messaging Service ${holder?.sid ?? 'another'}`,
+      );
+    }
+    // `'already'` answers the resource rather than a conflict: adding a number that is
+    // already in this pool asked for a state that is now true.
+    return reply.code(201).send(servicePhoneNumberResource(service, number));
+  });
+
+  app.get(`${MESSAGING}/Services/:serviceSid/PhoneNumbers`, async (request, reply) => {
+    const account = authenticateSelf(request, reply);
+    if (!account) return;
+    const { serviceSid } = request.params as { serviceSid: string };
+    const service = ownService(reply, account, serviceSid);
+    if (!service) return;
+    const { page, pageSize } = paging(request.query as { PageSize?: string; Page?: string });
+    const rows = store.messagingServices
+      .numbers(service.sid)
+      .map((number) => servicePhoneNumberResource(service, number));
+    return reply.send(
+      metaEnvelope(
+        'phone_numbers',
+        `${MESSAGING}/Services/${service.sid}/PhoneNumbers`,
+        rows,
+        page,
+        pageSize,
+      ),
+    );
+  });
+
+  app.delete(
+    `${MESSAGING}/Services/:serviceSid/PhoneNumbers/:numberSid`,
+    async (request, reply) => {
+      const account = authenticateSelf(request, reply);
+      if (!account) return;
+      const { serviceSid, numberSid } = request.params as {
+        serviceSid: string;
+        numberSid: string;
+      };
+      const service = ownService(reply, account, serviceSid);
+      if (!service) return;
+      if (!store.messagingServices.removeNumber(service.sid, numberSid)) {
+        return twilioError(reply, 404, 20404, `PhoneNumber ${numberSid} was not found`);
+      }
+      return reply.code(204).send();
+    },
+  );
+
   /* ------------------------------------------------------------ the catch-all */
 
   /**
@@ -986,14 +1241,20 @@ export function registerTwilioApi(app: FastifyInstance, deps: Deps): void {
    * would be read as a call that vanished. `20501` says what actually happened, and names
    * the path, so the next person knows what to add.
    */
-  app.all(`${API}/*`, async (request, reply) =>
+  const unfaked = async (request: FastifyRequest, reply: FastifyReply): Promise<void> =>
     twilioError(
       reply,
       501,
       20501,
       `${request.method} ${request.url.split('?')[0]} is not faked by localio`,
-    ),
-  );
+    );
+
+  app.all(`${API}/*`, unfaked);
+  // The messaging domain needs its own, for the same reason: `client.messaging.baseUrl`
+  // redirects the *whole* of it — Brand Registrations, Short Codes, US App-to-Person — and
+  // only `Services` is faked here. `/v1/*` is more specific than the static handler's
+  // `/*`, so this is what answers.
+  app.all(`${MESSAGING}/*`, unfaked);
 }
 
 /* ------------------------------------------------------------------ resources */
@@ -1109,6 +1370,66 @@ function messageResource(message: Message): Record<string, unknown> {
     price: null,
     price_unit: null,
     messaging_service_sid: message.messagingServiceSid,
+  };
+}
+
+/**
+ * A Messaging Service, in the **`v1`** shape.
+ *
+ * `url` and `links`, not `uri` and `subresource_uris` — that is the difference between the
+ * two domains, and the SDK reads whichever its own domain sends.
+ */
+function serviceResource(service: MessagingService): Record<string, unknown> {
+  return {
+    sid: service.sid,
+    account_sid: service.accountSid,
+    friendly_name: service.friendlyName,
+    inbound_request_url: service.inboundRequestUrl,
+    inbound_method: service.inboundMethod,
+    status_callback: service.statusCallbackUrl,
+    // The fields Twilio always sends, at their defaults. None are honoured — there is no
+    // sticky sender, no smart encoding, no geomatch — and that is in the README's list of
+    // what this is not. They are here so an application reading one off the SDK's resource
+    // gets a value rather than `undefined`.
+    fallback_url: null,
+    fallback_method: 'POST',
+    fallback_to_long_code: false,
+    sticky_sender: true,
+    smart_encoding: false,
+    mms_converter: true,
+    scan_message_content: 'inherit',
+    area_code_geomatch: false,
+    validity_period: 14400,
+    synchronous_validation: false,
+    use_inbound_webhook_on_number: false,
+    usecase: 'undeclared',
+    us_app_to_person_registered: false,
+    date_created: iso8601(service.createdAt),
+    date_updated: iso8601(service.updatedAt),
+    url: `${MESSAGING}/Services/${service.sid}`,
+    // **Only the subresource that exists.** `Messages.json` once advertised a `Media.json`
+    // it had not registered, and the SDK failed on a link this very file handed it; naming
+    // `short_codes` or `us_app_to_person` here would run that again against the `/v1`
+    // catch-all. Everything else is a `501` that says so.
+    links: { phone_numbers: `${MESSAGING}/Services/${service.sid}/PhoneNumbers` },
+  };
+}
+
+/** One number's membership of a pool. The `sid` is the `PN…` itself, as at Twilio. */
+function servicePhoneNumberResource(
+  service: MessagingService,
+  number: PhoneNumber,
+): Record<string, unknown> {
+  return {
+    sid: number.sid,
+    account_sid: number.accountSid,
+    service_sid: service.sid,
+    phone_number: number.phoneNumber,
+    country_code: 'US',
+    capabilities: ['SMS', 'MMS', 'Voice'],
+    date_created: iso8601(number.createdAt),
+    date_updated: iso8601(number.createdAt),
+    url: `${MESSAGING}/Services/${service.sid}/PhoneNumbers/${number.sid}`,
   };
 }
 

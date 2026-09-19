@@ -8,8 +8,8 @@ import { randomBytes } from 'node:crypto';
  * then fails against a real account, so there is one function and every mint goes
  * through it.
  *
- * The prefixes in use: `AC` an account, `CA` a call, `MZ` a media stream, `SM` a message,
- * `PN` an incoming phone number, `RE` a recording, `SK` an API key.
+ * The prefixes in use: `AC` an account, `CA` a call, `MG` a messaging service, `MZ` a media
+ * stream, `SM` a message, `PN` an incoming phone number, `RE` a recording, `SK` an API key.
  */
 export function providerId(prefix: string): string {
   return `${prefix}${randomBytes(16).toString('hex')}`;

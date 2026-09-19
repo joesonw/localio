@@ -6,7 +6,11 @@
     "its own configuration, and this simulator will answer to it.",
     "A number with no account_sid joins the first account in this file.",
     "parent_account_sid makes an account a subaccount. Either order works — the parent may",
-    "be listed after the child — and the parent's credentials open the child over REST."
+    "be listed after the child — and the parent's credentials open the child over REST.",
+    "A messaging_services entry is a pool: a message sent with its sid and no From goes out",
+    "from a random number in phone_numbers, and inbound_request_url answers for every one",
+    "of them instead of each number's own sms_url. The pool is declarative — the list here",
+    "is what it becomes — and services are keyed by sid, or by friendly_name if none is set."
   ],
   "accounts": [
     {
@@ -37,6 +41,20 @@
       "friendly_name": "tenant-a line",
       "voice_url": "http://127.0.0.1:3000/webhooks/voice",
       "sms_url": "http://127.0.0.1:3000/webhooks/sms"
+    },
+    {
+      "phone_number": "+15550000003",
+      "friendly_name": "pool line",
+      "voice_url": "http://127.0.0.1:3000/webhooks/voice"
+    }
+  ],
+  "messaging_services": [
+    {
+      "sid": "MG00000000000000000000000000000001",
+      "friendly_name": "notifications",
+      "inbound_request_url": "http://127.0.0.1:3000/webhooks/sms",
+      "inbound_method": "POST",
+      "phone_numbers": ["+15550000001", "+15550000003"]
     }
   ]
 }

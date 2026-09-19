@@ -275,3 +275,98 @@ test('an inbound message webhook says it was received', async () => {
   const inbound = poster.sent.find((s) => s.kind === 'message');
   assert.equal(inbound?.params.SmsStatus, 'received');
 });
+
+/* ------------------------------------------------------- the pool's inbound URL */
+
+test("a pooled number answers at the service's URL, not its own", async () => {
+  const { store, sms, poster } = fixture();
+  const { recipient } = twoParties(store);
+  const destination = store.numbers.findByNumber('+15550000002');
+  assert.ok(destination);
+  const service = store.messagingServices.create({
+    accountSid: recipient,
+    friendlyName: 'support',
+    inboundRequestUrl: 'http://recipient.test/pool',
+    inboundMethod: 'GET',
+  });
+  store.messagingServices.addNumber(service.sid, destination.sid);
+
+  await sms.send({ from: '+15550000001', to: '+15550000002', body: 'hi' });
+
+  const [inbound] = poster.sent.filter((s) => s.kind === 'message');
+  assert.equal(inbound?.url, 'http://recipient.test/pool');
+  assert.equal(inbound?.method, 'GET');
+  // The application routing on this is how it tells one pool's traffic from another's.
+  assert.equal(inbound?.params.MessagingServiceSid, service.sid);
+});
+
+test('a service with no inbound URL leaves the number answering where it did', async () => {
+  const { store, sms, poster } = fixture();
+  const { recipient } = twoParties(store);
+  const destination = store.numbers.findByNumber('+15550000002');
+  assert.ok(destination);
+  const service = store.messagingServices.create({ accountSid: recipient, friendlyName: 'quiet' });
+  store.messagingServices.addNumber(service.sid, destination.sid);
+
+  await sms.send({ from: '+15550000001', to: '+15550000002', body: 'hi' });
+
+  const [inbound] = poster.sent.filter((s) => s.kind === 'message');
+  assert.equal(inbound?.url, 'http://recipient.test/sms');
+  // Nothing to route on, so nothing is sent — a blank string reads as a service.
+  assert.equal(inbound?.params.MessagingServiceSid, undefined);
+});
+
+/**
+ * The arrangement a pool is most likely to be set up as: numbers with no `sms_url` of
+ * their own, answered entirely through the service. Resolved below the `smsUrl` check
+ * this is silently `delivered` and the handler never hears about it.
+ */
+test('a pooled number with no sms_url of its own is still delivered', async () => {
+  const { store, sms, poster } = fixture();
+  const account = store.accounts.create({ friendlyName: 'recipient' });
+  store.numbers.create({ phoneNumber: '+15550000001', accountSid: account.accountSid });
+  const bare = store.numbers.create({
+    phoneNumber: '+15550000002',
+    accountSid: account.accountSid,
+  });
+  const service = store.messagingServices.create({
+    accountSid: account.accountSid,
+    friendlyName: 'support',
+    inboundRequestUrl: 'http://recipient.test/pool',
+  });
+  store.messagingServices.addNumber(service.sid, bare.sid);
+
+  const result = await sms.send({ from: '+15550000001', to: '+15550000002', body: 'hi' });
+
+  assert.equal(result.message.status, 'delivered');
+  assert.equal(poster.sent.filter((s) => s.kind === 'message')[0]?.url, 'http://recipient.test/pool');
+});
+
+test("the pool's webhook is signed with the destination account's token", async () => {
+  const { store, sms, poster } = fixture();
+  const { recipient } = twoParties(store);
+  const destination = store.numbers.findByNumber('+15550000002');
+  assert.ok(destination);
+  const service = store.messagingServices.create({
+    accountSid: recipient,
+    friendlyName: 'support',
+    inboundRequestUrl: 'http://recipient.test/pool',
+  });
+  store.messagingServices.addNumber(service.sid, destination.sid);
+
+  await sms.send({ from: '+15550000001', to: '+15550000002', body: 'hi' });
+
+  const [inbound] = poster.sent.filter((s) => s.kind === 'message');
+  assert.ok(inbound);
+  const token = store.accounts.find(recipient)?.authToken;
+  assert.equal(inbound.authToken, token);
+  // Signed over the *service's* URL, which is the one it was posted to.
+  assert.ok(
+    twilio.validateRequest(
+      token ?? '',
+      signRequest(token ?? '', inbound.url, inbound.params),
+      inbound.url,
+      inbound.params,
+    ),
+  );
+});

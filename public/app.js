@@ -27,6 +27,7 @@ const state = {
   accounts: [],
   keys: [],
   numbers: [],
+  services: [],
   panel: 'phone',
   /** One of our numbers: whose handset this is. `''` until a number exists. */
   sim: readStoredSim(),
@@ -116,6 +117,28 @@ const el = (tag, className, text) => {
  * Read out of `state.accounts`, which the admin refresh loads before the keys and the
  * numbers, so the name is always the one the accounts table above is showing.
  */
+/**
+ * Put `nodes` in `host`, leaving any node already in the right place alone.
+ *
+ * `host.textContent = ''` and append-again is simpler and was what both card lists did, but
+ * **moving a node detaches it, and detaching blurs whatever was focused inside it**. Both
+ * lists deliberately keep an open editor across the two-second poll; re-appending it still
+ * took the caret out of it every tick. A plain box merely lost the cursor, which is why
+ * this went unnoticed — a picker lost the typed text outright, because an autocomplete
+ * commits on blur and unmatched text commits to nothing.
+ *
+ * Not a general reconciler. The lists are short and in a stable order, and all this has to
+ * do is not disturb the one card that is already correct.
+ */
+function reconcile(host, nodes) {
+  for (let i = 0; i < nodes.length; i += 1) {
+    const current = host.childNodes[i];
+    if (current === nodes[i]) continue;
+    host.insertBefore(nodes[i], current ?? null);
+  }
+  while (host.childNodes.length > nodes.length) host.lastChild.remove();
+}
+
 const accountLabel = (sid) => {
   const name = state.accounts.find((account) => account.account_sid === sid)?.friendly_name;
   return name ? `${sid} / ${name}` : sid;
@@ -253,6 +276,9 @@ const keyAccount = createAutocomplete({ input: document.getElementById('k-accoun
  */
 const accountParent = createAutocomplete({ input: document.getElementById('account-parent') });
 
+/** The fourth: the account on the messaging service form. A pool is one account's. */
+const serviceAccount = createAutocomplete({ input: document.getElementById('ms-account') });
+
 const accountOption = (account) => ({
   value: account.account_sid,
   label: account.friendly_name || 'unnamed',
@@ -264,7 +290,7 @@ function fillAccountSelect() {
   // is 34 characters that would fill the box on its own. `matches` searches both, so a
   // pasted sid still finds its account.
   const options = state.accounts.map(accountOption);
-  for (const picker of [numberAccount, keyAccount]) {
+  for (const picker of [numberAccount, keyAccount, serviceAccount]) {
     // `setOptions` keeps the current pick and leaves a focused box alone, which is what
     // makes this safe to call from the two-second poll.
     picker.setOptions(options);
@@ -419,16 +445,18 @@ function renderNumbers() {
   // A form being typed into is not something a poll gets to redraw: rebuilding it from the
   // server row would wipe whatever was half-entered. The node is moved, not recreated.
   const openEditor = state.editing === null ? null : host.querySelector('.card.on');
-  host.textContent = '';
   if (state.numbers.length === 0) {
-    host.append(el('p', 'empty', 'No numbers yet. Add one above; until then every call answers no_such_number.'));
+    reconcile(host, [
+      el('p', 'empty', 'No numbers yet. Add one above; until then every call answers no_such_number.'),
+    ]);
     return;
   }
-  for (const number of state.numbers) {
-    host.append(
+  reconcile(
+    host,
+    state.numbers.map((number) =>
       state.editing === number.sid ? (openEditor ?? numberEditor(number)) : numberCard(number),
-    );
-  }
+    ),
+  );
 }
 
 function numberCard(number) {
@@ -471,6 +499,9 @@ function numberCard(number) {
       await api(`/admin/numbers/${number.sid}`, { method: 'DELETE' });
       await loadNumbers();
       await loadAccounts();
+      // A released number leaves whatever pool held it, and the card below must not keep
+      // drawing a chip for a number that is gone.
+      await loadServices();
     } catch (error) {
       showError('number-error', error);
     }
@@ -588,6 +619,309 @@ document.getElementById('number-form').addEventListener('submit', async (event) 
     await loadAccounts();
   } catch (error) {
     showError('number-error', error);
+  }
+});
+
+/* ----------------------------------------------------- messaging services */
+
+/**
+ * The pool section.
+ *
+ * Shares `state.editing` with the numbers above rather than keeping a second key: one
+ * editor open at a time is both the simpler rule and the better behaviour, and an `MG…`
+ * can never collide with a `PN…`, so each renderer's `.card.on` lookup finds only its own.
+ */
+/**
+ * The open pool editor's refresh hook, or `null`.
+ *
+ * Out of the DOM for the same reason `state.editing` is — except inverted: that node is the
+ * one thing on this panel the poll must *not* rebuild, so the poll needs a way to hand it
+ * new server state instead. One slot, because only one editor is ever open.
+ */
+let openPool = null;
+
+async function loadServices() {
+  const { messaging_services: services } = await api('/admin/messaging-services');
+  state.services = services;
+  renderServices();
+}
+
+function renderServices() {
+  const host = document.getElementById('services');
+  const openEditor = state.editing === null ? null : host.querySelector('.card.on');
+  // `state.editing` is shared with the numbers section above, so opening a number's editor
+  // closes this one — and the hook into a card that is no longer on screen goes with it.
+  if (openPool && openPool.sid !== state.editing) openPool = null;
+  // **The node is kept and handed new state; it is not rebuilt.** The boxes above are the
+  // user's half-typed text and the picker below holds a pick that has not been added yet,
+  // so replacing the node loses both — but the chips are the server's answer and must not
+  // go on showing a number that has left the pool. `update` is the seam between the two.
+  if (openEditor && openPool) {
+    const service = state.services.find((each) => each.sid === state.editing);
+    if (service) openPool.update(service);
+  }
+  if (state.services.length === 0) {
+    reconcile(host, [
+      el('p', 'empty', 'No messaging services. A MessagingServiceSid only resolves to a pool once there is one.'),
+    ]);
+    return;
+  }
+  reconcile(
+    host,
+    state.services.map((service) =>
+      state.editing === service.sid ? (openEditor ?? serviceEditor(service)) : serviceCard(service),
+    ),
+  );
+}
+
+function serviceCard(service) {
+  const card = el('div', 'card');
+  const head = el('div', 'card-head');
+  head.append(el('span', 'card-title', service.friendly_name || 'unnamed'));
+  head.append(el('span', 'card-meta', service.sid));
+  card.append(head);
+
+  const body = el('dl', 'card-body');
+  const pool = service.phone_numbers.map((number) => number.phone_number).join(', ');
+  for (const [label, value] of [
+    ['inbound', service.inbound_request_url ? `${service.inbound_method} ${service.inbound_request_url}` : null],
+    ['status', service.status_callback_url],
+    ['account', accountLabel(service.account_sid)],
+    ['pool', pool || null],
+  ]) {
+    body.append(el('dt', '', label), el('dd', '', value ?? (label === 'pool' ? '— empty' : '— not set')));
+  }
+  card.append(body);
+
+  const actions = el('div', 'card-actions');
+  const edit = el('button', 'link', 'edit');
+  edit.addEventListener('click', () => {
+    state.editing = service.sid;
+    renderServices();
+  });
+  const remove = el('button', 'link', 'delete');
+  remove.addEventListener('click', async () => {
+    // Names what is left behind, the way releasing a number does: the pool goes, and
+    // nothing else does.
+    const message =
+      `Delete ${service.friendly_name || service.sid}?\n\n` +
+      `${service.phone_numbers.length} number(s) leave the pool. They keep their own SMS ` +
+      `URLs, and the messages sent through this service keep its sid.`;
+    if (!confirm(message)) return;
+    try {
+      showError('service-error', null);
+      await api(`/admin/messaging-services/${service.sid}`, { method: 'DELETE' });
+      await loadServices();
+    } catch (error) {
+      showError('service-error', error);
+    }
+  });
+  actions.append(edit, remove);
+  card.append(actions);
+  return card;
+}
+
+function serviceEditor(service) {
+  const card = el('div', 'card on');
+  const head = el('div', 'card-head');
+  head.append(el('span', 'card-title', service.friendly_name || 'unnamed'));
+  head.append(el('span', 'card-meta', service.sid));
+  card.append(head);
+
+  const form = el('form', 'stack');
+  const inputs = {};
+  const field = (key, label, value, type = 'url') => {
+    const wrap = el('label', '', label);
+    const input = el('input');
+    input.type = type;
+    input.value = value ?? '';
+    inputs[key] = input;
+    wrap.append(input);
+    return wrap;
+  };
+
+  const rowOne = el('div', 'fields');
+  rowOne.append(field('friendly_name', 'name', service.friendly_name, 'text'));
+  form.append(rowOne);
+
+  const rowTwo = el('div', 'fields');
+  rowTwo.append(field('inbound_request_url', 'inbound url', service.inbound_request_url));
+  const methodWrap = el('label', 'narrow', 'method');
+  const methodSelect = el('select');
+  for (const option of ['POST', 'GET']) methodSelect.append(el('option', '', option));
+  methodSelect.value = service.inbound_method;
+  inputs.inbound_method = methodSelect;
+  methodWrap.append(methodSelect);
+  rowTwo.append(methodWrap);
+  rowTwo.append(field('status_callback_url', 'status callback', service.status_callback_url));
+  form.append(rowTwo);
+
+  const actions = el('div', 'actions');
+  const save = el('button', '', 'Save');
+  save.type = 'submit';
+  const cancel = el('button', '', 'Cancel');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => {
+    state.editing = null;
+    renderServices();
+  });
+  actions.append(save, cancel);
+  form.append(actions);
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const patch = {};
+    for (const [key, input] of Object.entries(inputs)) patch[key] = input.value;
+    try {
+      showError('service-error', null);
+      await api(`/admin/messaging-services/${service.sid}`, { method: 'PATCH', body: patch });
+      state.editing = null;
+      await loadServices();
+    } catch (error) {
+      showError('service-error', error);
+    }
+  });
+
+  card.append(form);
+  card.append(poolEditor(service));
+  return card;
+}
+
+/**
+ * The pool, as chips plus a picker.
+ *
+ * **Each add and each remove is sent immediately**, rather than gathered up and committed
+ * with the Save above. A chip row that only committed on Save would need a client-side
+ * diff against a list the two-second poll is rewriting underneath it, and the two would
+ * disagree the moment anything else touched the pool.
+ */
+function poolEditor(service) {
+  const wrap = el('div', 'stack pool');
+  wrap.append(el('div', 'hint', 'pool — a send with no From goes out from one of these, at random'));
+
+  const chips = el('div', 'chips');
+  wrap.append(chips);
+
+  const row = el('div', 'fields');
+  const pickerWrap = el('label', '', 'add a number');
+  const input = el('input');
+  input.type = 'text';
+  pickerWrap.append(input);
+  row.append(pickerWrap);
+  const add = el('button', '', 'Add');
+  add.type = 'button';
+  row.append(add);
+  wrap.append(row);
+
+  // Only this account's numbers, and only ones no service already holds — the two things
+  // the server refuses, kept out of the list rather than offered and then rejected.
+  const optionsFor = () => {
+    const pooled = new Set(
+      state.services.flatMap((each) => each.phone_numbers.map((number) => number.sid)),
+    );
+    return state.numbers
+      .filter((number) => number.account_sid === service.account_sid && !pooled.has(number.sid))
+      .map((number) => ({
+        value: number.sid,
+        label: number.phone_number,
+        hint: number.friendly_name || '',
+      }));
+  };
+
+  // Built once and never replaced. The pick it is holding has not been added yet, so it is
+  // the user's, exactly like the half-typed boxes above.
+  const picker = createAutocomplete({ input, options: optionsFor() });
+
+  const renderChips = (members) => {
+    chips.textContent = '';
+    for (const number of members) {
+      const chip = el('span', 'chip', number.phone_number);
+      const drop = el('button', 'link', '×');
+      drop.type = 'button';
+      drop.title = `take ${number.phone_number} out of the pool`;
+      drop.addEventListener('click', async () => {
+        try {
+          showError('service-error', null);
+          await api(`/admin/messaging-services/${service.sid}/numbers/${number.sid}`, {
+            method: 'DELETE',
+          });
+          await loadServices();
+        } catch (error) {
+          showError('service-error', error);
+        }
+      });
+      chip.append(drop);
+      chips.append(chip);
+    }
+    if (members.length === 0) chips.append(el('span', 'empty', 'empty'));
+  };
+
+  const key = (members) => members.map((number) => number.sid).join(',');
+  let drawn = key(service.phone_numbers);
+  renderChips(service.phone_numbers);
+
+  /**
+   * New server state for a node that is staying.
+   *
+   * The chips are redrawn only when the pool actually changed: rebuilding them on every
+   * two-second tick is churn for nothing, and it can swallow a `×` clicked across a tick
+   * by replacing the button between its `mousedown` and its `click`. `setOptions` is the
+   * poller-safe half — it keeps the current pick and leaves a focused box alone.
+   */
+  const update = (next) => {
+    const fresh = key(next.phone_numbers);
+    if (fresh !== drawn) {
+      drawn = fresh;
+      renderChips(next.phone_numbers);
+    }
+    picker.setOptions(optionsFor());
+  };
+
+  openPool = { sid: service.sid, update };
+
+  add.addEventListener('click', async () => {
+    if (!picker.value) return;
+    try {
+      showError('service-error', null);
+      await api(`/admin/messaging-services/${service.sid}/numbers`, {
+        method: 'POST',
+        body: { phone_number_sid: picker.value },
+      });
+      // Cleared before the reload: the number is a chip now, and it drops out of the
+      // options with it — after which `setOptions` can no longer resolve the held value to
+      // a label, and the box would sit on a name for something that is no longer offered.
+      picker.setValue('', { quiet: true });
+      await loadServices();
+    } catch (error) {
+      showError('service-error', error);
+    }
+  });
+
+  return wrap;
+}
+
+document.getElementById('service-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const body = {
+    account_sid: serviceAccount.value,
+    friendly_name: document.getElementById('ms-name').value.trim(),
+    inbound_request_url: document.getElementById('ms-inbound').value,
+    inbound_method: document.getElementById('ms-inbound-method').value,
+    status_callback_url: document.getElementById('ms-status').value,
+  };
+  if (!body.account_sid) {
+    showError('service-error', new Error('create an account first — a pool is one account’s'));
+    return;
+  }
+  try {
+    showError('service-error', null);
+    await api('/admin/messaging-services', { method: 'POST', body });
+    for (const id of ['ms-name', 'ms-inbound', 'ms-status']) {
+      document.getElementById(id).value = '';
+    }
+    await loadServices();
+  } catch (error) {
+    showError('service-error', error);
   }
 });
 
@@ -1100,6 +1434,7 @@ async function refresh() {
       await loadAccounts();
       await loadKeys();
       await loadNumbers();
+      await loadServices();
     } else {
       await Promise.all([loadHistory(), loadIncoming(), loadMessages()]);
     }
@@ -1178,6 +1513,7 @@ void (async () => {
   await loadAccounts();
   await loadKeys();
   await loadNumbers();
+  await loadServices();
   await refresh();
   // Coarse and only for the panel on screen. See the header. It stays even with the stream
   // open: it is what heals a strip the stream got wrong, and the only thing the other

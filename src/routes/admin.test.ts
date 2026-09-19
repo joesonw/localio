@@ -241,3 +241,189 @@ test('a seed that lists a subaccount before its parent still links it', async ()
   assert.equal(child.parent_account_sid, parentSid);
   await server.close();
 });
+
+/* ------------------------------------------------------ messaging services */
+
+test('a messaging service round-trips, pool and all', async () => {
+  const { server, store, accountSid } = await fixture();
+  for (const phoneNumber of ['+15550000001', '+15550000002']) {
+    store.numbers.create({ phoneNumber, accountSid });
+  }
+  const created = await server.app.inject({
+    method: 'POST',
+    url: '/admin/messaging-services',
+    payload: {
+      account_sid: accountSid,
+      friendly_name: 'support',
+      inbound_request_url: 'http://app.test/pool',
+      phone_numbers: ['+15550000001', '+15550000002'],
+    },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const sid = created.json().sid;
+  assert.match(sid, /^MG[0-9a-f]{32}$/);
+  assert.equal(created.json().phone_numbers.length, 2);
+
+  const patched = await server.app.inject({
+    method: 'PATCH',
+    url: `/admin/messaging-services/${sid}`,
+    payload: { friendly_name: 'renamed', inbound_request_url: '' },
+  });
+  assert.equal(patched.json().friendly_name, 'renamed');
+  assert.equal(patched.json().inbound_request_url, null);
+
+  const deleted = await server.app.inject({
+    method: 'DELETE',
+    url: `/admin/messaging-services/${sid}`,
+  });
+  assert.equal(deleted.statusCode, 204);
+  // The pool went with it; the numbers did not.
+  assert.equal(store.numbers.list(accountSid).length, 2);
+  await server.close();
+});
+
+/** The account is fixed at creation, and a PATCH naming it must say so rather than no-op. */
+test('a PATCH naming the account is a 400, not a silent no-op', async () => {
+  const { server, store, accountSid } = await fixture();
+  const service = store.messagingServices.create({ accountSid, friendlyName: 'support' });
+  const response = await server.app.inject({
+    method: 'PATCH',
+    url: `/admin/messaging-services/${service.sid}`,
+    payload: { account_sid: accountSid },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().error, 'invalid_request');
+  await server.close();
+});
+
+test('a pool is one account\'s, and a number is in one service', async () => {
+  const { server, store, accountSid } = await fixture();
+  const stranger = store.accounts.create({ friendlyName: 'stranger' });
+  const mine = store.numbers.create({ phoneNumber: '+15550000001', accountSid });
+  const theirs = store.numbers.create({
+    phoneNumber: '+15558888888',
+    accountSid: stranger.accountSid,
+  });
+  const service = store.messagingServices.create({ accountSid, friendlyName: 'support' });
+  const other = store.messagingServices.create({ accountSid, friendlyName: 'billing' });
+
+  const wrongAccount = await server.app.inject({
+    method: 'POST',
+    url: `/admin/messaging-services/${service.sid}/numbers`,
+    payload: { phone_number_sid: theirs.sid },
+  });
+  assert.equal(wrongAccount.statusCode, 400);
+  assert.equal(wrongAccount.json().error, 'wrong_account');
+  assert.match(wrongAccount.json().message, new RegExp(stranger.accountSid));
+
+  const added = await server.app.inject({
+    method: 'POST',
+    url: `/admin/messaging-services/${service.sid}/numbers`,
+    payload: { phone_number_sid: mine.sid },
+  });
+  assert.equal(added.statusCode, 201);
+
+  const taken = await server.app.inject({
+    method: 'POST',
+    url: `/admin/messaging-services/${other.sid}/numbers`,
+    payload: { phone_number_sid: mine.sid },
+  });
+  assert.equal(taken.statusCode, 409);
+  assert.equal(taken.json().error, 'in_another_service');
+  assert.match(taken.json().message, new RegExp(service.sid));
+
+  const removed = await server.app.inject({
+    method: 'DELETE',
+    url: `/admin/messaging-services/${service.sid}/numbers/${mine.sid}`,
+  });
+  assert.equal(removed.statusCode, 204);
+  const again = await server.app.inject({
+    method: 'DELETE',
+    url: `/admin/messaging-services/${service.sid}/numbers/${mine.sid}`,
+  });
+  assert.equal(again.json().error, 'not_in_service');
+  await server.close();
+});
+
+/** A pool stated up front is one intention: half of it applied is not what was asked for. */
+test('a bad number in a stated pool writes nothing at all', async () => {
+  const { server, store, accountSid } = await fixture();
+  store.numbers.create({ phoneNumber: '+15550000001', accountSid });
+  const response = await server.app.inject({
+    method: 'POST',
+    url: '/admin/messaging-services',
+    payload: {
+      account_sid: accountSid,
+      friendly_name: 'support',
+      phone_numbers: ['+15550000001', '+15559999999'],
+    },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().error, 'no_such_number');
+  assert.deepEqual(store.messagingServices.list(accountSid), []);
+  await server.close();
+});
+
+test('releasing a pooled number shrinks the pool and keeps the service', async () => {
+  const { server, store, accountSid } = await fixture();
+  const number = store.numbers.create({ phoneNumber: '+15550000001', accountSid });
+  const service = store.messagingServices.create({ accountSid, friendlyName: 'support' });
+  store.messagingServices.addNumber(service.sid, number.sid);
+
+  const released = await server.app.inject({
+    method: 'DELETE',
+    url: `/admin/numbers/${number.sid}`,
+  });
+  assert.equal(released.statusCode, 204);
+  const read = await server.app.inject({ url: `/admin/messaging-services/${service.sid}` });
+  assert.deepEqual(read.json().phone_numbers, []);
+  await server.close();
+});
+
+test('seeding twice does not re-mint the service, and converges the pool', async () => {
+  const { server, store } = await fixture();
+  const seed = {
+    accounts: [{ account_sid: 'AC' + '1'.repeat(32), friendly_name: 'dev' }],
+    numbers: [{ phone_number: '+15550000001' }, { phone_number: '+15550000002' }],
+    messaging_services: [
+      {
+        sid: 'MG' + '1'.repeat(32),
+        friendly_name: 'notifications',
+        phone_numbers: ['+15550000001', '+15550000002'],
+      },
+    ],
+  };
+  for (const _ of [0, 1]) {
+    const response = await server.app.inject({ method: 'POST', url: '/admin/seed', payload: seed });
+    assert.equal(response.statusCode, 200, response.body);
+  }
+  assert.equal(store.messagingServices.list().length, 1);
+  assert.equal(store.messagingServices.numberCount(seed.messaging_services[0]!.sid), 2);
+
+  // The pool is declarative: stating one member makes the pool one member.
+  seed.messaging_services[0]!.phone_numbers = ['+15550000002'];
+  await server.app.inject({ method: 'POST', url: '/admin/seed', payload: seed });
+  assert.deepEqual(
+    store.messagingServices
+      .numbers(seed.messaging_services[0]!.sid)
+      .map((n) => n.phoneNumber),
+    ['+15550000002'],
+  );
+  await server.close();
+});
+
+test('a seed pool naming an unheld number is refused, naming both', async () => {
+  const { server } = await fixture();
+  const response = await server.app.inject({
+    method: 'POST',
+    url: '/admin/seed',
+    payload: {
+      accounts: [{ account_sid: 'AC' + '1'.repeat(32), friendly_name: 'dev' }],
+      messaging_services: [
+        { sid: 'MG' + '1'.repeat(32), friendly_name: 'x', phone_numbers: ['+15559999999'] },
+      ],
+    },
+  });
+  assert.equal(response.statusCode, 500);
+  await server.close();
+});

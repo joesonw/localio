@@ -55,23 +55,26 @@ TwiML executor, which reaches the outside world only through a host interface.
   executor touches no socket, DB or clock — only `ExecutionHost`, which is what makes
   `execute.test.ts` possible. **Unknown verbs are logged and skipped, never fatal**
   (`<Gather>` and `<Dial>` take that path).
-- **`src/db/`** — six stores over one `better-sqlite3` connection, exposed as `Store`.
+- **`src/db/`** — seven stores over one `better-sqlite3` connection, exposed as `Store`.
   Routes take `Store`, never a raw `Db`; a route writing its own SQL is how a second sid
   mint site appears. Migrations are an append-only `STEPS` ladder in `open.ts` keyed on
   `PRAGMA user_version` — **never edit a released step**; step 2 is `002-api-keys.sql`,
-  step 3 `003-subaccounts.sql` and step 4 `004-twilio-fidelity.sql`.
+  step 3 `003-subaccounts.sql`, step 4 `004-twilio-fidelity.sql` and step 5
+  `005-messaging-services.sql`.
   The `.sql` files are read relative to the module, which is why the build copies them
   into `dist/db/`.
-- **`src/routes/`** — three families plus static: `/2010-04-01` (Twilio REST, HTTP Basic
-  against `accounts`), `/admin` (accounts, API keys and numbers, unauthenticated), `/api` (what the
-  UI draws, unauthenticated). A subaccount is a *full* account carrying a
+- **`src/routes/`** — four families plus static: `/2010-04-01` (Twilio REST, HTTP Basic
+  against `accounts`), `/v1` (Twilio's *messaging* domain — Messaging Services, same Basic
+  auth), `/admin` (accounts, API keys, numbers and messaging services, unauthenticated),
+  `/api` (what the UI draws, unauthenticated). A subaccount is a *full* account carrying a
   `parent_account_sid`, so everything that takes an `account_sid` already works on one;
   the only code that knows the difference is `authenticate()` and the `Accounts.json`
   routes. `/api/calls/stream` is the one non-JSON route in the family: SSE, written
   straight onto `reply.raw` after `reply.hijack()`, fed by `call-feed.ts`.
 - **`public/`** — no framework, no build step, plain ES modules. Render with `textContent`
   and `append`, never `innerHTML`: this page displays TwiML from another process and
-  message bodies verbatim. Two panels: **Phone** and **Admin** (accounts, API keys, numbers). `app.js` owns the page,
+  message bodies verbatim. Two panels: **Phone** and **Admin** (accounts, API keys, numbers,
+  messaging services). `app.js` owns the page,
   `handset.js` owns the socket and the audio, `autocomplete.js` is the number picker.
   **`state.sim` is what the Phone panel means by "here"** — the calls, the keypad and the
   conversations are all that one number's, so anything added there filters by it rather
@@ -150,10 +153,35 @@ behaviour somewhere far away.
   `POST Messages.json` lands on the message row; `SmsService.settle()` is the only place a
   message status is written, so every outcome reports, and it signs with the **sender's**
   token. There is no SMS status callback on a number — migration 4 dropped that column.
-- **REST response shape.** snake_case, RFC 2822 timestamps, `duration` as a string,
-  unknowable fields (`price`, `answered_by`, `caller_name`) as `null`, unknown sids as
-  Twilio's `20404` envelope, unimplemented paths as `501` naming the path. Each of these
-  is what the Twilio SDK's deserializer actually needs.
+- **REST response shape, and it is per domain.** snake_case, unknowable fields (`price`,
+  `answered_by`, `caller_name`) as `null`, unknown sids as Twilio's `20404` envelope,
+  unimplemented paths as `501` naming the path. **The timestamps and the list envelope
+  differ between the two families and both spellings are correct**: `/2010-04-01` sends RFC
+  2822, `duration` as a string and `pageEnvelope`'s `next_page_uri`, while `/v1` sends ISO
+  8601 and `metaEnvelope`'s `meta.next_page_url`. Each is what that domain's own
+  deserializer in the SDK parses; "fixing" `/v1` to match the other makes
+  `client.messaging.v1.services.list()` stop after one page and report a truncated set as
+  the whole of it.
+- **A Messaging Service resolves a sender; it never becomes one.** `POST Messages.json`
+  once read `body.From ?? body.MessagingServiceSid`, which put an `MG…` into the message's
+  `from_number` column — where `findByNumber`, `usage()` and every thread view read it as a
+  phone number and found nothing, raising nothing. It goes through
+  `messagingServices.pick()`, whose `rand` is injectable so the choice is assertable; an
+  empty pool is a `21703` rather than a sender invented out of nothing.
+- **`/v1` has no account in the path, so the credential is the account.** Every route there
+  uses `authenticateSelf`, not `authenticate`. A parent's credentials act as the *parent*,
+  never as a child — there is no path in which to name one. It is the one family where the
+  "the account in the path wins" rule has no path to obey, and Twilio's messaging domain is
+  the same. `ours()` must cover both prefixes or an unfaked `/v1` path's `501` appears in
+  no log.
+- **A pool is one account's, and the join table cascades both ways.** A member from another
+  account is refused at every write site, because `sms.ts` signs a pooled delivery with the
+  *destination account's* token and a stranger's number would be verified against the wrong
+  one — a blanket 403 with nothing naming why. And `ON DELETE CASCADE` on both foreign keys
+  is what keeps `PhoneNumbers.remove()` — a bare `DELETE` that has never heard of services
+  — from failing as an opaque `SQLITE_CONSTRAINT`. The pool's `inbound_request_url` wins
+  over a member's own `sms_url`, and is resolved *above* the `smsUrl` check, or a pooled
+  number with no URL of its own never reaches the pool's handler at all.
 - **Webhooks never throw.** `webhook.ts` returns a `WebhookResult`; a transport failure is
   status `0`. A 403, a 404 and an empty document are outcomes this tool exists to make
   legible.

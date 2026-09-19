@@ -285,6 +285,8 @@ export function messageForm(facts: {
   to: string;
   body: string;
   numSegments?: number;
+  /** Set only when the destination is in a pool, exactly as Twilio sets it. */
+  messagingServiceSid?: string | null;
 }): Record<string, string> {
   return {
     MessageSid: facts.messageSid,
@@ -297,6 +299,10 @@ export function messageForm(facts: {
     NumMedia: '0',
     NumSegments: String(facts.numSegments ?? 1),
     SmsStatus: 'received',
+    // Omitted rather than sent empty when there is no service: an application routing on
+    // `MessagingServiceSid` reads a blank string as a service just as readily as a sid, and
+    // Twilio simply leaves the field off.
+    ...(facts.messagingServiceSid ? { MessagingServiceSid: facts.messagingServiceSid } : {}),
     ApiVersion: API_VERSION,
   };
 }
