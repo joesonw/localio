@@ -10,6 +10,10 @@
 
 A local Twilio. Voice, SMS and recordings, on SQLite, in one process.
 
+![The Phone panel — picker, calls, keypad and conversations](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview1.jpg)
+
+![The Admin panel — accounts, API keys and phone numbers](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview2.jpg)
+
 Point your application's Twilio base URL at it and it answers the REST API. Give one of
 its numbers your webhook URL and it posts signed webhooks at you, reads the TwiML you
 answer with, and runs it — including `<Record>`, which writes a real WAV you can play back.
@@ -94,23 +98,7 @@ from inside a container is rarely the default: set it when recordings come back 
 URL your application cannot fetch.
 
 Images are published on every tag (`joesonw/localio:1.2.3`, `:1.2`, `:1`, `:latest`) and
-on `main` (`:main`), for `linux/amd64` and `linux/arm64`. The image's page on Docker Hub is
-[DOCKERHUB.md](DOCKERHUB.md), pushed by the same workflow that builds the image.
-
-## The two panels
-
-| panel | what it does |
-| --- | --- |
-| **Phone** | one of your numbers, as a handset. Calls waiting to be picked up sit across the top; pick a number under them and everything below is its own: its calls on the left, the keypad in the middle, its conversations on the right. |
-| **Admin** | accounts, API keys, phone numbers and messaging services. Create an account to get a sid and token, name a parent to make it a subaccount, mint a key if the application under test is built with one, add numbers and edit their webhook URLs in place, and pool numbers into a messaging service. Subaccounts sit indented under their parent, with a status you can suspend from here. This is the only configuration there is. |
-
-![The Phone panel — picker, calls, keypad and conversations](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview1.jpg)
-
-*The Phone panel: one number, its calls, its keypad, its conversations.*
-
-![The Admin panel — accounts, API keys and phone numbers](https://raw.githubusercontent.com/joesonw/localio/main/docs/preview2.jpg)
-
-*The Admin panel: accounts and subaccounts, API keys, and numbers with their webhook URLs.*
+on `main` (`:main`), for `linux/amd64` and `linux/arm64`.
 
 ### The Phone panel
 
