@@ -93,7 +93,9 @@ behaviour somewhere far away.
 - **Signing.** `signature.ts` signs the *exact* URL requested, query string included, then
   every param sorted by key name. The URL signed and the URL posted to are one string
   (a number's `voice_url` column) so they cannot drift. Body and signature come from one
-  map. `GET` webhooks sign the URL with params on it and an empty body. Failure mode: a
+  map. `GET` webhooks sign the URL with params on it and an empty body, and so does the
+  `<Connect><Stream>` upgrade request: the `wss://` URL actually dialled (post-override),
+  no params. Failure mode: a
   blanket 403 with nothing naming the character that differed — hence
   `signature.test.ts`, which runs the real `twilio` SDK's `validateRequest` against our
   output. **`twilio` must stay a devDependency**; this is an independent implementation on

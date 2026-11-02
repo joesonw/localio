@@ -392,7 +392,10 @@ a new one; its optional `holder` is the claim the page took when Pick up was cli
 it is checked only so a tab that lost is told early — see below.
 
 This is the only socket localio *serves*. The `<Connect><Stream>` socket is one it **dials
-outward**, at the URL the TwiML named.
+outward**, at the URL the TwiML named. Its upgrade request carries `X-Twilio-Signature`,
+signed as Twilio does: over the exact `wss://` URL dialled (after `STREAM_URL_OVERRIDE`,
+query string included) with no parameters, so `validateRequest(token, signature, url, {})`
+accepts it.
 
 Everything else is `public/`, served at `/` and registered last, so it only ever sees a
 path nothing above matched.

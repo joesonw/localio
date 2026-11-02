@@ -14,6 +14,7 @@ import type { Account, PhoneNumber, Store } from './db/index.js';
 import { mulawToPcm16, pcm16ToMulaw } from './g711.js';
 import { providerId } from './provider-id.js';
 import { Recorder } from './recorder.js';
+import { SIGNATURE_HEADER, signRequest } from './signature.js';
 import type { SmsService } from './sms.js';
 import {
   decodeAudio,
@@ -733,7 +734,16 @@ export class CallSession implements ExecutionHost {
     }
 
     this.streamSid = providerId('MZ');
-    const gateway = new WebSocket(target.toString());
+    // Twilio signs the upgrade request like a `GET` webhook: the exact URL dialled, query
+    // string included, and no parameters — the `<Parameter>` children ride in the `start`
+    // frame, not the handshake. It is the URL *after* the override, because that is the
+    // one the far end receives and rebuilds; signing the document's own URL instead would
+    // fail validation on exactly the setups that use the override. Signed and dialled from
+    // one string so the two cannot drift, and with the owning account's token, never a key.
+    const streamUrl = target.toString();
+    const gateway = new WebSocket(streamUrl, {
+      headers: { [SIGNATURE_HEADER]: signRequest(this.authToken, streamUrl, {}) },
+    });
     this.gateway = gateway;
 
     await new Promise<void>((resolve) => {
@@ -756,7 +766,7 @@ export class CallSession implements ExecutionHost {
           type: 'connected',
           call_sid: this.callSid,
           stream_sid: this.streamSid,
-          stream_url: target.toString(),
+          stream_url: streamUrl,
         });
       });
 

@@ -93,6 +93,14 @@ test('an empty body still signs the url', () => {
   check('https://app.example.com/status?call=CA1', {});
 });
 
+/**
+ * **The `<Connect><Stream>` handshake is signed too**, over the `wss://` URL dialled with an
+ * empty parameter map — which is how an application validates the upgrade request.
+ */
+test('a media stream upgrade url is accepted by the real verifier', () => {
+  check('wss://app.example.com/media?agent_id=agt_42', {});
+});
+
 /** The negative: a body the signature did not cover must not verify. */
 test('a changed parameter invalidates the signature', () => {
   const url = 'https://app.example.com/voice';
